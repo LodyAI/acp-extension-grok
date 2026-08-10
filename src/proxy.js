@@ -1,8 +1,4 @@
-import { readFileSync } from 'node:fs';
-
-const runtimeManifest = JSON.parse(
-  readFileSync(new URL('../runtime-manifest.json', import.meta.url), 'utf8')
-);
+import runtimeManifest from '../runtime-manifest.json' with { type: 'json' };
 
 const PERMISSION_MODES = {
   ask: { permission_mode: 'ask', yolo_mode: false, auto_mode: false },
