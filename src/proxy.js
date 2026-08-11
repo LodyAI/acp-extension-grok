@@ -14,6 +14,8 @@ const INTERACTION_TO_RUNTIME = { agent: 'default', plan: 'plan', ask: 'ask' };
 const INTERACTION_FROM_RUNTIME = { default: 'agent', plan: 'plan', ask: 'ask' };
 const USD_TICKS_PER_USD = 10_000_000_000;
 const MAX_TRACKED_PROMPTS = 256;
+const FIVE_HOUR_WINDOW_MINS = 5 * 60;
+const SEVEN_DAY_WINDOW_MINS = 7 * 24 * 60;
 
 function logicalExtensionMethod(method) {
   return typeof method === 'string' && method.startsWith('_') ? method.slice(1) : method;
@@ -25,6 +27,10 @@ function wireExtensionMethod(method) {
 
 function nonnegativeNumber(value) {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : 0;
+}
+
+function optionalNonnegativeNumber(value) {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : undefined;
 }
 
 function normalizeUsageModel(usage, usageIsIncomplete) {
@@ -77,6 +83,60 @@ function usageNotification(promptUsage) {
   return {
     jsonrpc: '2.0',
     method: wireExtensionMethod(runtimeManifest.privateWireContract.lodyUsageNotification),
+    params,
+  };
+}
+
+export function normalizeBillingRateLimits(billing) {
+  if (!billing || typeof billing !== 'object') return undefined;
+  const config = billing.config;
+  if (!config || typeof config !== 'object') return undefined;
+
+  let usedPercent = optionalNonnegativeNumber(config.creditUsagePercent);
+  if (usedPercent === undefined) {
+    const limit = optionalNonnegativeNumber(config.monthlyLimit?.val);
+    const used = optionalNonnegativeNumber(config.used?.val);
+    if (limit && used !== undefined) usedPercent = (used / limit) * 100;
+  }
+  if (usedPercent === undefined) return undefined;
+  usedPercent = Math.min(100, usedPercent);
+
+  const start = config.currentPeriod?.start ?? config.billingPeriodStart;
+  const end = config.currentPeriod?.end ?? config.billingPeriodEnd;
+  const startMs = typeof start === 'string' ? Date.parse(start) : Number.NaN;
+  const endMs = typeof end === 'string' ? Date.parse(end) : Number.NaN;
+  const measuredWindowDurationMins =
+    Number.isFinite(startMs) && Number.isFinite(endMs) && endMs > startMs
+      ? Math.round((endMs - startMs) / 60_000)
+      : null;
+  const windowDurationMins =
+    config.currentPeriod?.type === 'USAGE_PERIOD_TYPE_WEEKLY'
+      ? SEVEN_DAY_WINDOW_MINS
+      : measuredWindowDurationMins;
+  const resetsAt = Number.isFinite(endMs) ? endMs : null;
+  const isFiveHour = windowDurationMins === FIVE_HOUR_WINDOW_MINS;
+  const isSevenDay = windowDurationMins === SEVEN_DAY_WINDOW_MINS;
+  const tier = billing.subscriptionTier ?? billing.subscription_tier;
+
+  return {
+    schemaVersion: 2,
+    planName: typeof tier === 'string' && tier.trim() ? tier : null,
+    limitName: 'Grok Build',
+    limitId: 'grok',
+    windows: [{ usedPercent, windowDurationMins, resetsAt }],
+    fiveHour: isFiveHour ? usedPercent : null,
+    sevenDay: isSevenDay ? usedPercent : null,
+    fiveHourResetAt: isFiveHour ? resetsAt : null,
+    sevenDayResetAt: isSevenDay ? resetsAt : null,
+  };
+}
+
+function rateLimitsNotification(billing) {
+  const params = normalizeBillingRateLimits(billing);
+  if (!params) return undefined;
+  return {
+    jsonrpc: '2.0',
+    method: wireExtensionMethod(runtimeManifest.privateWireContract.lodyRateLimitsNotification),
     params,
   };
 }
@@ -165,17 +225,25 @@ export class GrokAcpCompatibilityProxy {
     const id = this.nextInternalRequestId;
     this.nextInternalRequestId -= 1;
     this.pending.set(id, { kind, sessionId });
+    const isBilling = kind === 'billing';
     return {
       jsonrpc: '2.0',
       id,
-      method: wireExtensionMethod(runtimeManifest.privateWireContract.sessionInfoRequest),
-      params: { sessionId },
+      method: wireExtensionMethod(
+        isBilling
+          ? runtimeManifest.privateWireContract.billingRequest
+          : runtimeManifest.privateWireContract.sessionInfoRequest
+      ),
+      params: isBilling ? {} : { sessionId },
     };
   }
 
-  contextRequestForPrompt(state, promptId) {
-    if (promptId && !rememberPrompt(state.contextPromptIds, promptId)) return undefined;
-    return this.internalRequest('context', state.sessionId);
+  usageRefreshRequestsForPrompt(state, promptId) {
+    if (promptId && !rememberPrompt(state.usageRefreshPromptIds, promptId)) return [];
+    return [
+      this.internalRequest('context', state.sessionId),
+      this.internalRequest('billing', state.sessionId),
+    ];
   }
 
   usageForPrompt(state, promptId, promptUsage) {
@@ -330,8 +398,7 @@ export class GrokAcpCompatibilityProxy {
         if (!isReplay) {
           const usage = this.usageForPrompt(state, promptId, update.usage);
           if (usage) toClient.push(usage);
-          const contextRequest = this.contextRequestForPrompt(state, promptId);
-          if (contextRequest) toRuntime.push(contextRequest);
+          toRuntime.push(...this.usageRefreshRequestsForPrompt(state, promptId));
         }
         return { toRuntime, toClient };
       }
@@ -369,13 +436,19 @@ export class GrokAcpCompatibilityProxy {
     if (pending.kind === 'context') {
       if (message.error) return { toRuntime: [], toClient: [] };
       const sessionInfo = unwrapExtensionResult(message.result);
-      const contextNotification = contextUsageNotification(
-        pending.sessionId,
-        sessionInfo?.context
-      );
+      const contextNotification = contextUsageNotification(pending.sessionId, sessionInfo?.context);
       return {
         toRuntime: [],
         toClient: contextNotification ? [contextNotification] : [],
+      };
+    }
+
+    if (pending.kind === 'billing') {
+      if (message.error) return { toRuntime: [], toClient: [] };
+      const notification = rateLimitsNotification(unwrapExtensionResult(message.result));
+      return {
+        toRuntime: [],
+        toClient: notification ? [notification] : [],
       };
     }
 
@@ -388,7 +461,10 @@ export class GrokAcpCompatibilityProxy {
       const state = this.stateFromSessionResponse(sessionId, pending.clientIdentifier, result);
       this.sessions.set(sessionId, state);
       return {
-        toRuntime: [this.internalRequest('context', sessionId)],
+        toRuntime: [
+          this.internalRequest('context', sessionId),
+          this.internalRequest('billing', sessionId),
+        ],
         toClient: [
           {
             ...message,
@@ -404,9 +480,8 @@ export class GrokAcpCompatibilityProxy {
       const meta = message.result?._meta;
       const promptId = meta?.promptId ?? meta?.requestId;
       const usage = this.usageForPrompt(state, promptId, meta?.usage);
-      const contextRequest = this.contextRequestForPrompt(state, promptId);
       return {
-        toRuntime: contextRequest ? [contextRequest] : [],
+        toRuntime: this.usageRefreshRequestsForPrompt(state, promptId),
         toClient: usage ? [message, usage] : [message],
       };
     }
@@ -463,7 +538,7 @@ export class GrokAcpCompatibilityProxy {
         old?.reasoningEffort ??
         reasoningEfforts[0],
       usagePromptIds: old?.usagePromptIds ?? new Set(),
-      contextPromptIds: old?.contextPromptIds ?? new Set(),
+      usageRefreshPromptIds: old?.usageRefreshPromptIds ?? new Set(),
     };
   }
 

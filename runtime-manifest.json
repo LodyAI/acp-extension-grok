@@ -11,7 +11,9 @@
     "sessionUpdateNotification": "x.ai/session/update",
     "turnCompletedUpdate": "turn_completed",
     "sessionInfoRequest": "x.ai/session/info",
+    "billingRequest": "x.ai/billing",
     "lodyUsageNotification": "acp_ext:session_usage_update",
+    "lodyRateLimitsNotification": "acp_ext:session_rate_limits",
     "reasoningEffortMeta": "reasoningEffort",
     "autoPermissionMode": false
   }

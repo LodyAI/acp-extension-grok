@@ -21,6 +21,9 @@ Supported configuration:
 - The adapter queries `x.ai/session/info` after session setup and completed
   prompts, then emits standard ACP `usage_update` context-window updates. Replay
   events never re-record historical billing usage.
+- The adapter queries `x.ai/billing` after session setup and completed prompts,
+  then maps the official credit usage percentage and billing period to Lody's
+  `acp_ext:session_rate_limits` extension. Billing failures never fail a session.
 
 The official 1.0.0 runtime does not expose an acknowledgement or a dependable
 feature-gate signal for automatic permission mode. The mapping is covered by

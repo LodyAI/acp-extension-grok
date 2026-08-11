@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   GrokAcpCompatibilityProxy,
+  normalizeBillingRateLimits,
   normalizePromptUsage,
   permissionNotification,
 } from '../src/proxy.js';
@@ -79,13 +80,17 @@ test('pins and synthesizes the official 1.0.0 private wire contract', () => {
       sessionUpdateNotification: runtimeManifest.privateWireContract.sessionUpdateNotification,
       turnCompletedUpdate: runtimeManifest.privateWireContract.turnCompletedUpdate,
       sessionInfoRequest: runtimeManifest.privateWireContract.sessionInfoRequest,
+      billingRequest: runtimeManifest.privateWireContract.billingRequest,
       lodyUsageNotification: runtimeManifest.privateWireContract.lodyUsageNotification,
+      lodyRateLimitsNotification: runtimeManifest.privateWireContract.lodyRateLimitsNotification,
     },
     {
       sessionUpdateNotification: 'x.ai/session/update',
       turnCompletedUpdate: 'turn_completed',
       sessionInfoRequest: 'x.ai/session/info',
+      billingRequest: 'x.ai/billing',
       lodyUsageNotification: 'acp_ext:session_usage_update',
+      lodyRateLimitsNotification: 'acp_ext:session_rate_limits',
     }
   );
   const { response } = readyProxy();
@@ -329,14 +334,16 @@ test('emits Lody token usage and requests authoritative context on turn completi
   assert.equal(output.toClient[0].method, '_x.ai/session/update');
   assert.equal(output.toClient[1].method, '_acp_ext:session_usage_update');
   assert.deepEqual(output.toClient[1].params, normalizePromptUsage(promptUsage));
-  assert.equal(output.toRuntime.length, 1);
+  assert.equal(output.toRuntime.length, 2);
   assert.equal(output.toRuntime[0].method, '_x.ai/session/info');
   assert.deepEqual(output.toRuntime[0].params, { sessionId: 'grok-session' });
+  assert.equal(output.toRuntime[1].method, '_x.ai/billing');
+  assert.deepEqual(output.toRuntime[1].params, {});
 });
 
 test('converts session info context into standard ACP usage_update for the existing UI', () => {
   const { proxy, startup } = readyProxy();
-  assert.equal(startup.toRuntime.length, 1);
+  assert.equal(startup.toRuntime.length, 2);
   assert.equal(startup.toRuntime[0].method, '_x.ai/session/info');
 
   const output = proxy.handleRuntime({
@@ -363,6 +370,80 @@ test('converts session info context into standard ACP usage_update for the exist
   ]);
 });
 
+test('converts official Grok billing into Lody session rate limits', () => {
+  const { proxy, startup } = readyProxy();
+  const billingRequest = startup.toRuntime.find((message) => message.method === '_x.ai/billing');
+  assert.ok(billingRequest);
+
+  const billing = {
+    config: {
+      creditUsagePercent: 42.5,
+      currentPeriod: {
+        type: 'USAGE_PERIOD_TYPE_WEEKLY',
+        start: '2026-06-01T00:00:00Z',
+        end: '2026-06-08T00:00:00Z',
+      },
+      onDemandCap: { val: 5_000 },
+      onDemandUsed: { val: 300 },
+      prepaidBalance: { val: 1_250 },
+    },
+    on_demand_enabled: true,
+    subscription_tier: 'SuperGrok Heavy',
+  };
+  const expected = {
+    schemaVersion: 2,
+    planName: 'SuperGrok Heavy',
+    limitName: 'Grok Build',
+    limitId: 'grok',
+    windows: [
+      {
+        usedPercent: 42.5,
+        windowDurationMins: 7 * 24 * 60,
+        resetsAt: Date.parse('2026-06-08T00:00:00Z'),
+      },
+    ],
+    fiveHour: null,
+    sevenDay: 42.5,
+    fiveHourResetAt: null,
+    sevenDayResetAt: Date.parse('2026-06-08T00:00:00Z'),
+  };
+  assert.deepEqual(normalizeBillingRateLimits(billing), expected);
+
+  const output = proxy.handleRuntime({
+    jsonrpc: '2.0',
+    id: billingRequest.id,
+    result: billing,
+  });
+  assert.deepEqual(output, {
+    toRuntime: [],
+    toClient: [
+      {
+        jsonrpc: '2.0',
+        method: '_acp_ext:session_rate_limits',
+        params: expected,
+      },
+    ],
+  });
+});
+
+test('falls back to legacy Grok billing totals and ignores unavailable billing', () => {
+  assert.equal(
+    normalizeBillingRateLimits({
+      config: { monthlyLimit: { val: 2_000 }, used: { val: 500 } },
+    }).windows[0].usedPercent,
+    25
+  );
+
+  const { proxy, startup } = readyProxy();
+  const billingRequest = startup.toRuntime.find((message) => message.method === '_x.ai/billing');
+  const output = proxy.handleRuntime({
+    jsonrpc: '2.0',
+    id: billingRequest.id,
+    error: { code: -32603, message: 'Billing unavailable' },
+  });
+  assert.deepEqual(output, { toRuntime: [], toClient: [] });
+});
+
 test('uses prompt response usage as a fallback and deduplicates turn_completed', () => {
   const { proxy } = readyProxy();
   proxy.handleClient({
@@ -381,6 +462,7 @@ test('uses prompt response usage as a fallback and deduplicates turn_completed',
   });
   assert.equal(promptResponse.toClient[1].method, '_acp_ext:session_usage_update');
   assert.equal(promptResponse.toRuntime[0].method, '_x.ai/session/info');
+  assert.equal(promptResponse.toRuntime[1].method, '_x.ai/billing');
 
   const durableCompletion = proxy.handleRuntime({
     jsonrpc: '2.0',
