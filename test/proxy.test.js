@@ -106,7 +106,7 @@ test('pins and synthesizes the official 1.0.0 private wire contract', () => {
     response.result.configOptions
       .find((option) => option.id === 'permission_mode')
       .options.map((option) => option.value),
-    ['ask', 'always-approve']
+    ['ask', 'auto', 'always-approve']
   );
 });
 
@@ -131,7 +131,7 @@ test('maps every permission mode to the official notification contract', () => {
   });
 });
 
-test('optimistically syncs ask and always-approve without forwarding set_config_option', () => {
+test('optimistically syncs permission modes over the private extension notification', () => {
   const { proxy } = readyProxy();
   const output = proxy.handleClient({
     jsonrpc: '2.0',
@@ -144,7 +144,7 @@ test('optimistically syncs ask and always-approve without forwarding set_config_
     },
   });
   assert.equal(output.toRuntime.length, 1);
-  assert.equal(output.toRuntime[0].method, 'x.ai/yolo_mode_changed');
+  assert.equal(output.toRuntime[0].method, '_x.ai/yolo_mode_changed');
   assert.equal(output.toRuntime[0].params.clientIdentifier, clientIdentifier);
   assert.equal(
     output.toClient[0].result.configOptions.find((option) => option.id === 'permission_mode')
@@ -153,7 +153,7 @@ test('optimistically syncs ask and always-approve without forwarding set_config_
   );
 });
 
-test('gracefully rejects auto while the pinned runtime gate cannot be confirmed', () => {
+test('exposes experimental auto permission mode', () => {
   const { proxy } = readyProxy();
   const output = proxy.handleClient({
     jsonrpc: '2.0',
@@ -165,8 +165,60 @@ test('gracefully rejects auto while the pinned runtime gate cannot be confirmed'
       value: 'auto',
     },
   });
-  assert.equal(output.toRuntime.length, 0);
-  assert.equal(output.toClient[0].error.code, -32602);
+  assert.equal(output.toRuntime[0].method, '_x.ai/yolo_mode_changed');
+  assert.deepEqual(output.toRuntime[0].params, {
+    clientIdentifier,
+    permission_mode: 'auto',
+    yolo_mode: false,
+    auto_mode: true,
+  });
+  assert.equal(
+    output.toClient[0].result.configOptions.find((option) => option.id === 'permission_mode')
+      .currentValue,
+    'auto'
+  );
+});
+
+test('translates and tracks interaction mode changes', () => {
+  const { proxy } = readyProxy();
+  const request = proxy.handleClient({
+    jsonrpc: '2.0',
+    id: 31,
+    method: 'session/set_config_option',
+    params: { sessionId: 'grok-session', configId: 'interaction_mode', value: 'ask' },
+  }).toRuntime[0];
+  assert.deepEqual(request, {
+    jsonrpc: '2.0',
+    id: 31,
+    method: 'session/set_mode',
+    params: { sessionId: 'grok-session', modeId: 'ask' },
+  });
+  proxy.handleRuntime({ jsonrpc: '2.0', id: 31, result: {} });
+  proxy.handleRuntime({
+    jsonrpc: '2.0',
+    method: 'session/update',
+    params: {
+      sessionId: 'grok-session',
+      update: { sessionUpdate: 'current_mode_update', currentModeId: 'plan' },
+    },
+  });
+  const response = proxy.handleClient({
+    jsonrpc: '2.0',
+    id: 32,
+    method: 'session/set_config_option',
+    params: { sessionId: 'grok-session', configId: 'reasoning_effort', value: 'low' },
+  });
+  const configResponse = proxy.handleRuntime({
+    jsonrpc: '2.0',
+    id: 32,
+    result: {},
+  }).toClient[0];
+  assert.equal(
+    configResponse.result.configOptions.find((option) => option.id === 'interaction_mode')
+      .currentValue,
+    'plan'
+  );
+  assert.equal(response.toRuntime[0].method, 'session/set_model');
 });
 
 test('translates reasoning effort through set_model and preserves the model id', () => {
@@ -426,7 +478,7 @@ test('converts official Grok billing into Lody session rate limits', () => {
   });
 });
 
-test('falls back to legacy Grok billing totals and ignores unavailable billing', () => {
+test('falls back to legacy Grok billing totals and clears stale limits on billing errors', () => {
   assert.equal(
     normalizeBillingRateLimits({
       config: { monthlyLimit: { val: 2_000 }, used: { val: 500 } },
@@ -441,7 +493,121 @@ test('falls back to legacy Grok billing totals and ignores unavailable billing',
     id: billingRequest.id,
     error: { code: -32603, message: 'Billing unavailable' },
   });
-  assert.deepEqual(output, { toRuntime: [], toClient: [] });
+  assert.deepEqual(output, {
+    toRuntime: [],
+    toClient: [
+      {
+        jsonrpc: '2.0',
+        method: '_acp_ext:session_rate_limits',
+        params: {
+          schemaVersion: 2,
+          planName: null,
+          limitName: 'Grok Build',
+          limitId: 'grok',
+          windows: [],
+          fiveHour: null,
+          sevenDay: null,
+          fiveHourResetAt: null,
+          sevenDayResetAt: null,
+          apiUnavailable: true,
+        },
+      },
+    ],
+  });
+});
+
+test('matches the official Grok TUI zero-percent fallback for fresh unified billing', () => {
+  assert.deepEqual(
+    normalizeBillingRateLimits({
+      config: {
+        currentPeriod: {
+          type: 'USAGE_PERIOD_TYPE_WEEKLY',
+          start: '2026-08-09T09:12:56Z',
+          end: '2026-08-16T09:12:56Z',
+        },
+        onDemandCap: { val: 0 },
+        onDemandUsed: { val: 0 },
+        prepaidBalance: { val: 0 },
+        isUnifiedBillingUser: true,
+      },
+      subscription_tier: 'X Premium+',
+    }),
+    {
+      schemaVersion: 2,
+      planName: 'X Premium+',
+      limitName: 'Grok Build',
+      limitId: 'grok',
+      windows: [
+        {
+          usedPercent: 0,
+          windowDurationMins: 7 * 24 * 60,
+          resetsAt: Date.parse('2026-08-16T09:12:56Z'),
+        },
+      ],
+      fiveHour: null,
+      sevenDay: 0,
+      fiveHourResetAt: null,
+      sevenDayResetAt: Date.parse('2026-08-16T09:12:56Z'),
+    }
+  );
+});
+
+test('keeps genuinely incomplete billing visible without inventing utilization', () => {
+  const limits = normalizeBillingRateLimits({
+    config: {
+      currentPeriod: {
+        type: 'USAGE_PERIOD_TYPE_WEEKLY',
+        start: '2026-08-09T09:12:56Z',
+        end: '2026-08-16T09:12:56Z',
+      },
+      isUnifiedBillingUser: true,
+    },
+    subscription_tier: 'X Premium+',
+  });
+  assert.equal(limits.apiUnavailable, true);
+  assert.deepEqual(limits.windows, []);
+});
+
+test('does not pair historical utilization with the current billing period', () => {
+  const limits = normalizeBillingRateLimits({
+    config: {
+      currentPeriod: {
+        type: 'USAGE_PERIOD_TYPE_WEEKLY',
+        start: '2026-08-16T00:00:00Z',
+        end: '2026-08-23T00:00:00Z',
+      },
+      history: [
+        {
+          type: 'USAGE_PERIOD_TYPE_WEEKLY',
+          start: '2026-08-09T00:00:00Z',
+          end: '2026-08-16T00:00:00Z',
+          creditUsagePercent: 87,
+        },
+      ],
+    },
+    subscription_tier: 'SuperGrok',
+  });
+  assert.equal(limits.apiUnavailable, true);
+  assert.deepEqual(limits.windows, []);
+});
+
+test('derives utilization from official billing history totals', () => {
+  const limits = normalizeBillingRateLimits({
+    config: {
+      history: [
+        {
+          type: 'USAGE_PERIOD_TYPE_WEEKLY',
+          start: '2026-08-09T00:00:00Z',
+          end: '2026-08-16T00:00:00Z',
+          monthlyLimit: { val: 1_000 },
+          totalUsed: { val: 250 },
+        },
+      ],
+    },
+    subscription_tier: 'SuperGrok',
+  });
+  assert.equal(limits.windows[0].usedPercent, 25);
+  assert.equal(limits.windows[0].windowDurationMins, 7 * 24 * 60);
 });
 
 test('uses prompt response usage as a fallback and deduplicates turn_completed', () => {

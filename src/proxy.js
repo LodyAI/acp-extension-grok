@@ -33,6 +33,59 @@ function optionalNonnegativeNumber(value) {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : undefined;
 }
 
+function optionalAmount(value) {
+  return optionalNonnegativeNumber(value?.val ?? value);
+}
+
+function billingUsagePercent(config, period, allowTopLevelFallback) {
+  const explicit = optionalNonnegativeNumber(period.creditUsagePercent);
+  if (explicit !== undefined) return explicit;
+  if (allowTopLevelFallback && period !== config) {
+    const topLevelExplicit = optionalNonnegativeNumber(config.creditUsagePercent);
+    if (topLevelExplicit !== undefined) return topLevelExplicit;
+  }
+
+  const limit = optionalAmount(
+    period.monthlyLimit ?? (allowTopLevelFallback ? config.monthlyLimit : undefined)
+  );
+  const used = optionalAmount(
+    period.totalUsed ??
+      period.includedUsed ??
+      period.used ??
+      (allowTopLevelFallback ? (config.totalUsed ?? config.used) : undefined)
+  );
+  if (limit && used !== undefined) return (used / limit) * 100;
+
+  // Grok Build 1.0.0 omits creditUsagePercent for a fresh unified-billing
+  // weekly period and reports each balance field as an explicit zero. Its own
+  // `/usage` UI renders that exact response as "Weekly limit: 0%", so mirror
+  // the official client only for this fully-zero, provider-authored shape.
+  const hasOfficialZeroUsage =
+    config.isUnifiedBillingUser === true &&
+    config.currentPeriod?.type === 'USAGE_PERIOD_TYPE_WEEKLY' &&
+    optionalAmount(config.onDemandCap) === 0 &&
+    optionalAmount(config.onDemandUsed) === 0 &&
+    optionalAmount(config.prepaidBalance) === 0;
+  if (hasOfficialZeroUsage) return 0;
+
+  return undefined;
+}
+
+function unavailableRateLimits(planName = null) {
+  return {
+    schemaVersion: 2,
+    planName,
+    limitName: 'Grok Build',
+    limitId: 'grok',
+    windows: [],
+    fiveHour: null,
+    sevenDay: null,
+    fiveHourResetAt: null,
+    sevenDayResetAt: null,
+    apiUnavailable: true,
+  };
+}
+
 function normalizeUsageModel(usage, usageIsIncomplete) {
   const inputTokens = nonnegativeNumber(usage?.inputTokens);
   const outputTokens = nonnegativeNumber(usage?.outputTokens);
@@ -92,17 +145,14 @@ export function normalizeBillingRateLimits(billing) {
   const config = billing.config;
   if (!config || typeof config !== 'object') return undefined;
 
-  let usedPercent = optionalNonnegativeNumber(config.creditUsagePercent);
-  if (usedPercent === undefined) {
-    const limit = optionalNonnegativeNumber(config.monthlyLimit?.val);
-    const used = optionalNonnegativeNumber(config.used?.val);
-    if (limit && used !== undefined) usedPercent = (used / limit) * 100;
-  }
-  if (usedPercent === undefined) return undefined;
-  usedPercent = Math.min(100, usedPercent);
+  const latestHistory = Array.isArray(config.history) ? config.history.at(-1) : undefined;
+  const period = config.currentPeriod ?? latestHistory ?? config;
+  const allowTopLevelFallback = period === config.currentPeriod || period === config;
+  let usedPercent = billingUsagePercent(config, period, allowTopLevelFallback);
+  if (usedPercent !== undefined) usedPercent = Math.min(100, usedPercent);
 
-  const start = config.currentPeriod?.start ?? config.billingPeriodStart;
-  const end = config.currentPeriod?.end ?? config.billingPeriodEnd;
+  const start = period?.start ?? period?.billingPeriodStart ?? config.billingPeriodStart;
+  const end = period?.end ?? period?.billingPeriodEnd ?? config.billingPeriodEnd;
   const startMs = typeof start === 'string' ? Date.parse(start) : Number.NaN;
   const endMs = typeof end === 'string' ? Date.parse(end) : Number.NaN;
   const measuredWindowDurationMins =
@@ -110,17 +160,23 @@ export function normalizeBillingRateLimits(billing) {
       ? Math.round((endMs - startMs) / 60_000)
       : null;
   const windowDurationMins =
-    config.currentPeriod?.type === 'USAGE_PERIOD_TYPE_WEEKLY'
+    period?.type === 'USAGE_PERIOD_TYPE_WEEKLY'
       ? SEVEN_DAY_WINDOW_MINS
       : measuredWindowDurationMins;
   const resetsAt = Number.isFinite(endMs) ? endMs : null;
   const isFiveHour = windowDurationMins === FIVE_HOUR_WINDOW_MINS;
   const isSevenDay = windowDurationMins === SEVEN_DAY_WINDOW_MINS;
   const tier = billing.subscriptionTier ?? billing.subscription_tier;
+  const planName = typeof tier === 'string' && tier.trim() ? tier : null;
+
+  if (usedPercent === undefined) {
+    if (!planName && windowDurationMins === null && resetsAt === null) return undefined;
+    return unavailableRateLimits(planName);
+  }
 
   return {
     schemaVersion: 2,
-    planName: typeof tier === 'string' && tier.trim() ? tier : null,
+    planName,
     limitName: 'Grok Build',
     limitId: 'grok',
     windows: [{ usedPercent, windowDurationMins, resetsAt }],
@@ -208,7 +264,7 @@ export function permissionNotification(clientIdentifier, mode) {
   if (!mapped) return undefined;
   return {
     jsonrpc: '2.0',
-    method: runtimeManifest.privateWireContract.permissionNotification,
+    method: wireExtensionMethod(runtimeManifest.privateWireContract.permissionNotification),
     params: { clientIdentifier, ...mapped },
   };
 }
@@ -405,6 +461,17 @@ export class GrokAcpCompatibilityProxy {
       return { toRuntime: [], toClient: [message] };
     }
 
+    if (message.method === 'session/update') {
+      const sessionId = message.params?.sessionId;
+      const update = message.params?.update;
+      const state = this.sessions.get(sessionId);
+      if (state && update?.sessionUpdate === 'current_mode_update') {
+        const interactionMode = INTERACTION_FROM_RUNTIME[update.currentModeId];
+        if (interactionMode) state.interactionMode = interactionMode;
+      }
+      return { toRuntime: [], toClient: [message] };
+    }
+
     if (logicalMethod === runtimeManifest.privateWireContract.sessionNotification) {
       const sessionId = message.params?.sessionId;
       const update = message.params?.update;
@@ -444,7 +511,20 @@ export class GrokAcpCompatibilityProxy {
     }
 
     if (pending.kind === 'billing') {
-      if (message.error) return { toRuntime: [], toClient: [] };
+      if (message.error) {
+        return {
+          toRuntime: [],
+          toClient: [
+            {
+              jsonrpc: '2.0',
+              method: wireExtensionMethod(
+                runtimeManifest.privateWireContract.lodyRateLimitsNotification
+              ),
+              params: unavailableRateLimits(),
+            },
+          ],
+        };
+      }
       const notification = rateLimitsNotification(unwrapExtensionResult(message.result));
       return {
         toRuntime: [],

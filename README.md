@@ -23,12 +23,14 @@ Supported configuration:
   events never re-record historical billing usage.
 - The adapter queries `x.ai/billing` after session setup and completed prompts,
   then maps the official credit usage percentage and billing period to Lody's
-  `acp_ext:session_rate_limits` extension. Billing failures never fail a session.
+  `acp_ext:session_rate_limits` extension. For the fresh unified-billing shape
+  where Grok explicitly returns zero cap, usage, and balance but omits the
+  percentage, the adapter mirrors the official `/usage` UI's weekly `0%`.
+  Billing failures never fail a session.
 
-The official 1.0.0 runtime does not expose an acknowledgement or a dependable
-feature-gate signal for automatic permission mode. The mapping is covered by
-contract tests, but the option remains hidden until a pinned official runtime
-can advertise that capability.
+Automatic permission mode is exposed as an experimental option. The official
+1.0.0 runtime accepts the private `auto_mode` notification but does not
+acknowledge it, so the adapter applies the selection optimistically.
 
 Run with:
 

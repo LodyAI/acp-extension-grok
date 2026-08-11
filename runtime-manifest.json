@@ -15,6 +15,6 @@
     "lodyUsageNotification": "acp_ext:session_usage_update",
     "lodyRateLimitsNotification": "acp_ext:session_rate_limits",
     "reasoningEffortMeta": "reasoningEffort",
-    "autoPermissionMode": false
+    "autoPermissionMode": true
   }
 }
