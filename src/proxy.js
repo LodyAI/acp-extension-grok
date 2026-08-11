@@ -1,5 +1,7 @@
 import runtimeManifest from '../runtime-manifest.json' with { type: 'json' };
 
+const contract = runtimeManifest.privateWireContract;
+
 const PERMISSION_MODES = {
   ask: { permission_mode: 'ask', yolo_mode: false, auto_mode: false },
   auto: { permission_mode: 'auto', yolo_mode: false, auto_mode: true },
@@ -10,11 +12,18 @@ const PERMISSION_MODES = {
   },
 };
 
+const INTERACTION_TO_RUNTIME = { agent: 'default', plan: 'plan' };
+const INTERACTION_FROM_RUNTIME = { default: 'agent', plan: 'plan', ask: 'plan' };
 // Grok 1.0.0 silently accepts `ask` without changing its runtime mode. Keep
 // legacy persisted Ask selections safe by degrading them to Plan, but do not
 // advertise Ask until the runtime reports and applies it.
-const INTERACTION_TO_RUNTIME = { agent: 'default', plan: 'plan', ask: 'plan' };
-const INTERACTION_FROM_RUNTIME = { default: 'agent', plan: 'plan', ask: 'plan' };
+const LEGACY_INTERACTION_ALIASES = { ask: 'plan' };
+
+const INTERNAL_REQUESTS = {
+  context: { contractKey: 'sessionInfoRequest', params: (sessionId) => ({ sessionId }) },
+  billing: { contractKey: 'billingRequest', params: () => ({}) },
+};
+
 const USD_TICKS_PER_USD = 10_000_000_000;
 const MAX_TRACKED_PROMPTS = 256;
 const FIVE_HOUR_WINDOW_MINS = 5 * 60;
@@ -25,37 +34,37 @@ function logicalExtensionMethod(method) {
 }
 
 function wireExtensionMethod(method) {
-  return method.startsWith('_') ? method : `_${method}`;
+  return `_${method}`;
 }
 
-function nonnegativeNumber(value) {
-  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : 0;
+function extensionNotification(contractKey, params) {
+  return { jsonrpc: '2.0', method: wireExtensionMethod(contract[contractKey]), params };
 }
 
 function optionalNonnegativeNumber(value) {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : undefined;
 }
 
+function nonnegativeNumber(value) {
+  return optionalNonnegativeNumber(value) ?? 0;
+}
+
 function optionalAmount(value) {
   return optionalNonnegativeNumber(value?.val ?? value);
 }
 
-function billingUsagePercent(config, period, allowTopLevelFallback) {
-  const explicit = optionalNonnegativeNumber(period.creditUsagePercent);
+function billingUsagePercent(config, period) {
+  // Only the current period may borrow the top-level balance fields; a
+  // historical period must never be paired with today's totals.
+  const fallback = period === config.currentPeriod ? config : {};
+  const explicit =
+    optionalNonnegativeNumber(period.creditUsagePercent) ??
+    optionalNonnegativeNumber(fallback.creditUsagePercent);
   if (explicit !== undefined) return explicit;
-  if (allowTopLevelFallback && period !== config) {
-    const topLevelExplicit = optionalNonnegativeNumber(config.creditUsagePercent);
-    if (topLevelExplicit !== undefined) return topLevelExplicit;
-  }
 
-  const limit = optionalAmount(
-    period.monthlyLimit ?? (allowTopLevelFallback ? config.monthlyLimit : undefined)
-  );
+  const limit = optionalAmount(period.monthlyLimit ?? fallback.monthlyLimit);
   const used = optionalAmount(
-    period.totalUsed ??
-      period.includedUsed ??
-      period.used ??
-      (allowTopLevelFallback ? (config.totalUsed ?? config.used) : undefined)
+    period.totalUsed ?? period.includedUsed ?? period.used ?? fallback.totalUsed ?? fallback.used
   );
   if (limit && used !== undefined) return (used / limit) * 100;
 
@@ -65,7 +74,7 @@ function billingUsagePercent(config, period, allowTopLevelFallback) {
   // the official client only for this fully-zero, provider-authored shape.
   const hasOfficialZeroUsage =
     config.isUnifiedBillingUser === true &&
-    config.currentPeriod?.type === 'USAGE_PERIOD_TYPE_WEEKLY' &&
+    config.currentPeriod?.type === contract.weeklyUsagePeriodType &&
     optionalAmount(config.onDemandCap) === 0 &&
     optionalAmount(config.onDemandUsed) === 0 &&
     optionalAmount(config.prepaidBalance) === 0;
@@ -74,18 +83,22 @@ function billingUsagePercent(config, period, allowTopLevelFallback) {
   return undefined;
 }
 
-function unavailableRateLimits(planName = null) {
+// A `window` of null means Grok could not tell us anything usable; Lody renders
+// that as unavailable rather than as zero utilization.
+function rateLimitsPayload(planName, window) {
+  const isFiveHour = window?.windowDurationMins === FIVE_HOUR_WINDOW_MINS;
+  const isSevenDay = window?.windowDurationMins === SEVEN_DAY_WINDOW_MINS;
   return {
     schemaVersion: 2,
     planName,
     limitName: 'Grok Build',
     limitId: 'grok',
-    windows: [],
-    fiveHour: null,
-    sevenDay: null,
-    fiveHourResetAt: null,
-    sevenDayResetAt: null,
-    apiUnavailable: true,
+    windows: window ? [window] : [],
+    fiveHour: isFiveHour ? window.usedPercent : null,
+    sevenDay: isSevenDay ? window.usedPercent : null,
+    fiveHourResetAt: isFiveHour ? window.resetsAt : null,
+    sevenDayResetAt: isSevenDay ? window.resetsAt : null,
+    ...(window ? {} : { apiUnavailable: true }),
   };
 }
 
@@ -95,13 +108,9 @@ function normalizeUsageModel(usage, usageIsIncomplete) {
   const cacheReadInputTokens = nonnegativeNumber(usage?.cachedReadTokens);
   const cacheCreationInputTokens = nonnegativeNumber(usage?.cacheCreationTokens);
   const reasoningOutputTokens = nonnegativeNumber(usage?.reasoningTokens);
-  const costUsdTicks = usage?.costUsdTicks;
+  const costUsdTicks = optionalNonnegativeNumber(usage?.costUsdTicks);
   const hasTrustworthyCost =
-    !usageIsIncomplete &&
-    usage?.costIsPartial !== true &&
-    typeof costUsdTicks === 'number' &&
-    Number.isFinite(costUsdTicks) &&
-    costUsdTicks >= 0;
+    !usageIsIncomplete && usage?.costIsPartial !== true && costUsdTicks !== undefined;
 
   return {
     // Grok's ACP totals include cache buckets in inputTokens and reasoning in
@@ -135,12 +144,7 @@ export function normalizePromptUsage(promptUsage) {
 
 function usageNotification(promptUsage) {
   const params = normalizePromptUsage(promptUsage);
-  if (!params) return undefined;
-  return {
-    jsonrpc: '2.0',
-    method: wireExtensionMethod(runtimeManifest.privateWireContract.lodyUsageNotification),
-    params,
-  };
+  return params && extensionNotification('lodyUsageNotification', params);
 }
 
 export function normalizeBillingRateLimits(billing) {
@@ -150,8 +154,7 @@ export function normalizeBillingRateLimits(billing) {
 
   const latestHistory = Array.isArray(config.history) ? config.history.at(-1) : undefined;
   const period = config.currentPeriod ?? latestHistory ?? config;
-  const allowTopLevelFallback = period === config.currentPeriod || period === config;
-  let usedPercent = billingUsagePercent(config, period, allowTopLevelFallback);
+  let usedPercent = billingUsagePercent(config, period);
   if (usedPercent !== undefined) usedPercent = Math.min(100, usedPercent);
 
   const start = period?.start ?? period?.billingPeriodStart ?? config.billingPeriodStart;
@@ -163,41 +166,23 @@ export function normalizeBillingRateLimits(billing) {
       ? Math.round((endMs - startMs) / 60_000)
       : null;
   const windowDurationMins =
-    period?.type === 'USAGE_PERIOD_TYPE_WEEKLY'
+    period?.type === contract.weeklyUsagePeriodType
       ? SEVEN_DAY_WINDOW_MINS
       : measuredWindowDurationMins;
   const resetsAt = Number.isFinite(endMs) ? endMs : null;
-  const isFiveHour = windowDurationMins === FIVE_HOUR_WINDOW_MINS;
-  const isSevenDay = windowDurationMins === SEVEN_DAY_WINDOW_MINS;
   const tier = billing.subscriptionTier ?? billing.subscription_tier;
   const planName = typeof tier === 'string' && tier.trim() ? tier : null;
 
   if (usedPercent === undefined) {
     if (!planName && windowDurationMins === null && resetsAt === null) return undefined;
-    return unavailableRateLimits(planName);
+    return rateLimitsPayload(planName, null);
   }
-
-  return {
-    schemaVersion: 2,
-    planName,
-    limitName: 'Grok Build',
-    limitId: 'grok',
-    windows: [{ usedPercent, windowDurationMins, resetsAt }],
-    fiveHour: isFiveHour ? usedPercent : null,
-    sevenDay: isSevenDay ? usedPercent : null,
-    fiveHourResetAt: isFiveHour ? resetsAt : null,
-    sevenDayResetAt: isSevenDay ? resetsAt : null,
-  };
+  return rateLimitsPayload(planName, { usedPercent, windowDurationMins, resetsAt });
 }
 
 function rateLimitsNotification(billing) {
   const params = normalizeBillingRateLimits(billing);
-  if (!params) return undefined;
-  return {
-    jsonrpc: '2.0',
-    method: wireExtensionMethod(runtimeManifest.privateWireContract.lodyRateLimitsNotification),
-    params,
-  };
+  return params && extensionNotification('lodyRateLimitsNotification', params);
 }
 
 function contextUsageNotification(sessionId, context) {
@@ -219,8 +204,11 @@ function unwrapExtensionResult(result) {
   return Object.prototype.hasOwnProperty.call(result, 'result') ? result.result : result;
 }
 
+// Returns true when the prompt is new to `set` — including when Grok gave us no
+// id to deduplicate on, in which case there is nothing to suppress.
 function rememberPrompt(set, promptId) {
-  if (!promptId || set.has(promptId)) return false;
+  if (!promptId) return true;
+  if (set.has(promptId)) return false;
   set.add(promptId);
   if (set.size > MAX_TRACKED_PROMPTS) {
     set.delete(set.values().next().value);
@@ -232,13 +220,20 @@ function errorResponse(id, message) {
   return { jsonrpc: '2.0', id, error: { code: -32602, message } };
 }
 
+function unsupportedConfigOption(id, configId) {
+  return {
+    toRuntime: [],
+    toClient: [errorResponse(id, `Unsupported Grok config option: ${configId}`)],
+  };
+}
+
 function optionName(value) {
   if (value === 'xhigh') return 'X-High';
   return value.charAt(0).toUpperCase() + value.slice(1);
 }
 
 function legacyOptions(result) {
-  const options = result?._meta?.[runtimeManifest.privateWireContract.sessionConfigMeta]?.options;
+  const options = result?._meta?.[contract.sessionConfigMeta]?.options;
   return Array.isArray(options) ? options : [];
 }
 
@@ -265,17 +260,16 @@ function selectOption(id, name, description, currentValue, options, category) {
 export function permissionNotification(clientIdentifier, mode) {
   const mapped = PERMISSION_MODES[mode];
   if (!mapped) return undefined;
-  return {
-    jsonrpc: '2.0',
-    method: wireExtensionMethod(runtimeManifest.privateWireContract.permissionNotification),
-    params: { clientIdentifier, ...mapped },
-  };
+  return extensionNotification('permissionNotification', { clientIdentifier, ...mapped });
 }
 
 export class GrokAcpCompatibilityProxy {
   constructor() {
     this.sessions = new Map();
     this.pending = new Map();
+    // Grok scopes yolo/auto mode to the Lody clientIdentifier, not to a session,
+    // so the selection outlives any single session and is stored by client.
+    this.permissionModes = new Map();
     this.nextInternalRequestId = Number.MAX_SAFE_INTEGER;
   }
 
@@ -284,31 +278,28 @@ export class GrokAcpCompatibilityProxy {
     const id = this.nextInternalRequestId;
     this.nextInternalRequestId -= 1;
     this.pending.set(id, { kind, sessionId });
-    const isBilling = kind === 'billing';
+    const { contractKey, params } = INTERNAL_REQUESTS[kind];
     return {
       jsonrpc: '2.0',
       id,
-      method: wireExtensionMethod(
-        isBilling
-          ? runtimeManifest.privateWireContract.billingRequest
-          : runtimeManifest.privateWireContract.sessionInfoRequest
-      ),
-      params: isBilling ? {} : { sessionId },
+      method: wireExtensionMethod(contract[contractKey]),
+      params: params(sessionId),
     };
   }
 
+  usageRefreshRequests(sessionId) {
+    return [this.internalRequest('context', sessionId), this.internalRequest('billing', sessionId)];
+  }
+
   usageRefreshRequestsForPrompt(state, promptId) {
-    if (promptId && !rememberPrompt(state.usageRefreshPromptIds, promptId)) return [];
-    return [
-      this.internalRequest('context', state.sessionId),
-      this.internalRequest('billing', state.sessionId),
-    ];
+    if (!rememberPrompt(state.usageRefreshPromptIds, promptId)) return [];
+    return this.usageRefreshRequests(state.sessionId);
   }
 
   usageForPrompt(state, promptId, promptUsage) {
     const notification = usageNotification(promptUsage);
     if (!notification) return undefined;
-    if (promptId && !rememberPrompt(state.usagePromptIds, promptId)) return undefined;
+    if (!rememberPrompt(state.usagePromptIds, promptId)) return undefined;
     return notification;
   }
 
@@ -354,7 +345,7 @@ export class GrokAcpCompatibilityProxy {
     }
 
     if (configId === 'permission_mode') {
-      if (value === 'auto' && !runtimeManifest.privateWireContract.autoPermissionMode) {
+      if (value === 'auto' && !contract.autoPermissionMode) {
         return {
           toRuntime: [],
           toClient: [
@@ -377,11 +368,7 @@ export class GrokAcpCompatibilityProxy {
           ],
         };
       }
-      for (const trackedState of this.sessions.values()) {
-        if (trackedState.clientIdentifier === state.clientIdentifier) {
-          trackedState.permissionMode = value;
-        }
-      }
+      this.permissionModes.set(state.clientIdentifier, value);
       return {
         toRuntime: [notification],
         toClient: [
@@ -411,7 +398,7 @@ export class GrokAcpCompatibilityProxy {
           sessionId,
           modelId: state.currentModelId,
           _meta: {
-            [runtimeManifest.privateWireContract.reasoningEffortMeta]: value,
+            [contract.reasoningEffortMeta]: value,
           },
         },
       };
@@ -422,19 +409,18 @@ export class GrokAcpCompatibilityProxy {
         method: 'session/set_model',
         params: { sessionId, modelId: value },
       };
-    } else if (configId === 'interaction_mode' && INTERACTION_TO_RUNTIME[value]) {
-      effectiveValue = INTERACTION_FROM_RUNTIME[INTERACTION_TO_RUNTIME[value]] ?? value;
+    } else if (configId === 'interaction_mode') {
+      effectiveValue = LEGACY_INTERACTION_ALIASES[value] ?? value;
+      const modeId = INTERACTION_TO_RUNTIME[effectiveValue];
+      if (!modeId) return unsupportedConfigOption(message.id, configId);
       translated = {
         jsonrpc: '2.0',
         id: message.id,
         method: 'session/set_mode',
-        params: { sessionId, modeId: INTERACTION_TO_RUNTIME[value] },
+        params: { sessionId, modeId },
       };
     } else {
-      return {
-        toRuntime: [],
-        toClient: [errorResponse(message.id, `Unsupported Grok config option: ${configId}`)],
-      };
+      return unsupportedConfigOption(message.id, configId);
     }
     this.pending.set(message.id, {
       kind: 'config',
@@ -447,63 +433,11 @@ export class GrokAcpCompatibilityProxy {
 
   handleRuntime(message) {
     if (!message || typeof message !== 'object') return { toRuntime: [], toClient: [message] };
-    const logicalMethod = logicalExtensionMethod(message.method);
-    if (logicalMethod === runtimeManifest.privateWireContract.sessionUpdateNotification) {
-      const sessionId = message.params?.sessionId;
-      const update = message.params?.update;
-      const state = this.sessions.get(sessionId);
-      if (
-        state &&
-        update?.sessionUpdate === runtimeManifest.privateWireContract.turnCompletedUpdate
-      ) {
-        const promptId = update.prompt_id ?? update.promptId;
-        const isReplay = message.params?._meta?.isReplay === true;
-        const toRuntime = [];
-        const toClient = [message];
-        if (!isReplay) {
-          const usage = this.usageForPrompt(state, promptId, update.usage);
-          if (usage) toClient.push(usage);
-          toRuntime.push(...this.usageRefreshRequestsForPrompt(state, promptId));
-        }
-        return { toRuntime, toClient };
-      }
-      return { toRuntime: [], toClient: [message] };
-    }
-
-    if (message.method === 'session/update') {
-      const sessionId = message.params?.sessionId;
-      const update = message.params?.update;
-      const state = this.sessions.get(sessionId);
-      if (state && update?.sessionUpdate === 'current_mode_update') {
-        const interactionMode = INTERACTION_FROM_RUNTIME[update.currentModeId];
-        if (interactionMode) state.interactionMode = interactionMode;
-      }
-      return { toRuntime: [], toClient: [message] };
-    }
-
-    if (logicalMethod === runtimeManifest.privateWireContract.sessionNotification) {
-      const sessionId = message.params?.sessionId;
-      const update = message.params?.update;
-      const state = this.sessions.get(sessionId);
-      if (state && update?.sessionUpdate === 'model_changed') {
-        const modelId = update.model_id ?? update.modelId;
-        const reasoningEffort = update.reasoning_effort ?? update.reasoningEffort;
-        if (typeof modelId === 'string') state.currentModelId = modelId;
-        if (typeof reasoningEffort === 'string') state.reasoningEffort = reasoningEffort;
-        return {
-          toRuntime: [this.internalRequest('context', sessionId)],
-          toClient: [message],
-        };
-      }
-      return { toRuntime: [], toClient: [message] };
-    }
 
     // JSON-RPC request IDs are scoped independently in each direction. Never
     // mistake a reverse request from Grok for a response to a Lody request that
     // happens to use the same numeric ID.
-    if (typeof message.method === 'string') {
-      return { toRuntime: [], toClient: [message] };
-    }
+    if (typeof message.method === 'string') return this.handleRuntimeMethod(message);
 
     const pending = this.pending.get(message.id);
     if (!pending) return { toRuntime: [], toClient: [message] };
@@ -520,21 +454,9 @@ export class GrokAcpCompatibilityProxy {
     }
 
     if (pending.kind === 'billing') {
-      if (message.error) {
-        return {
-          toRuntime: [],
-          toClient: [
-            {
-              jsonrpc: '2.0',
-              method: wireExtensionMethod(
-                runtimeManifest.privateWireContract.lodyRateLimitsNotification
-              ),
-              params: unavailableRateLimits(),
-            },
-          ],
-        };
-      }
-      const notification = rateLimitsNotification(unwrapExtensionResult(message.result));
+      const notification = message.error
+        ? extensionNotification('lodyRateLimitsNotification', rateLimitsPayload(null, null))
+        : rateLimitsNotification(unwrapExtensionResult(message.result));
       return {
         toRuntime: [],
         toClient: notification ? [notification] : [],
@@ -550,10 +472,7 @@ export class GrokAcpCompatibilityProxy {
       const state = this.stateFromSessionResponse(sessionId, pending.clientIdentifier, result);
       this.sessions.set(sessionId, state);
       return {
-        toRuntime: [
-          this.internalRequest('context', sessionId),
-          this.internalRequest('billing', sessionId),
-        ],
+        toRuntime: this.usageRefreshRequests(sessionId),
         toClient: [
           {
             ...message,
@@ -592,14 +511,52 @@ export class GrokAcpCompatibilityProxy {
     };
   }
 
+  handleRuntimeMethod(message) {
+    const passthrough = { toRuntime: [], toClient: [message] };
+    const sessionId = message.params?.sessionId;
+    const update = message.params?.update;
+    const state = this.sessions.get(sessionId);
+    if (!state) return passthrough;
+    const logicalMethod = logicalExtensionMethod(message.method);
+
+    if (
+      logicalMethod === contract.sessionUpdateNotification &&
+      update?.sessionUpdate === contract.turnCompletedUpdate
+    ) {
+      if (message.params?._meta?.isReplay === true) return passthrough;
+      const promptId = update.prompt_id ?? update.promptId;
+      const usage = this.usageForPrompt(state, promptId, update.usage);
+      return {
+        toRuntime: this.usageRefreshRequestsForPrompt(state, promptId),
+        toClient: usage ? [message, usage] : [message],
+      };
+    }
+
+    if (message.method === 'session/update' && update?.sessionUpdate === 'current_mode_update') {
+      const interactionMode = INTERACTION_FROM_RUNTIME[update.currentModeId];
+      if (interactionMode) state.interactionMode = interactionMode;
+      return passthrough;
+    }
+
+    if (
+      logicalMethod === contract.sessionNotification &&
+      update?.sessionUpdate === 'model_changed'
+    ) {
+      const modelId = update.model_id ?? update.modelId;
+      const reasoningEffort = update.reasoning_effort ?? update.reasoningEffort;
+      if (typeof modelId === 'string') state.currentModelId = modelId;
+      if (typeof reasoningEffort === 'string') state.reasoningEffort = reasoningEffort;
+      return {
+        toRuntime: [this.internalRequest('context', sessionId)],
+        toClient: [message],
+      };
+    }
+
+    return passthrough;
+  }
+
   stateFromSessionResponse(sessionId, clientIdentifier, result) {
     const old = this.sessions.get(sessionId);
-    const clientPermissionState =
-      !old && typeof clientIdentifier === 'string' && clientIdentifier.length > 0
-        ? Array.from(this.sessions.values()).find(
-            (state) => state.clientIdentifier === clientIdentifier
-          )
-        : undefined;
     const legacy = legacyOptions(result);
     const legacyModels = legacy.filter((option) => option.category === 'model');
     const legacyEfforts = legacy.filter((option) => option.category === 'mode');
@@ -616,7 +573,6 @@ export class GrokAcpCompatibilityProxy {
     return {
       sessionId,
       clientIdentifier: clientIdentifier ?? old?.clientIdentifier,
-      permissionMode: old?.permissionMode ?? clientPermissionState?.permissionMode ?? 'ask',
       interactionMode:
         INTERACTION_FROM_RUNTIME[result.modes?.currentModeId] ?? old?.interactionMode ?? 'agent',
       currentModelId,
@@ -662,7 +618,7 @@ export class GrokAcpCompatibilityProxy {
         description: 'Approve protected actions automatically',
       },
     ];
-    if (runtimeManifest.privateWireContract.autoPermissionMode) {
+    if (contract.autoPermissionMode) {
       permissions.splice(1, 0, {
         value: 'auto',
         name: 'Auto',
@@ -682,7 +638,7 @@ export class GrokAcpCompatibilityProxy {
         'permission_mode',
         'Permission Mode',
         'Controls protected tool approvals',
-        state.permissionMode,
+        this.permissionModes.get(state.clientIdentifier) ?? 'ask',
         permissions,
         '_permission'
       ),
