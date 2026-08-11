@@ -1,6 +1,12 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { GrokAcpCompatibilityProxy, permissionNotification } from '../src/proxy.js';
+import {
+  GrokAcpCompatibilityProxy,
+  normalizeBillingRateLimits,
+  normalizePromptUsage,
+  permissionNotification,
+} from '../src/proxy.js';
+import runtimeManifest from '../runtime-manifest.json' with { type: 'json' };
 
 const clientIdentifier = 'lody:session-1';
 const sessionResponse = {
@@ -42,10 +48,51 @@ function readyProxy() {
       _meta: { clientIdentifier },
     },
   });
-  return { proxy, response: proxy.handleRuntime(sessionResponse).toClient[0] };
+  const startup = proxy.handleRuntime(sessionResponse);
+  return { proxy, startup, response: startup.toClient[0] };
 }
 
+const promptUsage = {
+  inputTokens: 1_000,
+  outputTokens: 250,
+  cachedReadTokens: 300,
+  cacheCreationTokens: 100,
+  reasoningTokens: 50,
+  costUsdTicks: 250_000_000,
+  modelUsage: {
+    'grok-build': {
+      inputTokens: 1_000,
+      outputTokens: 250,
+      cachedReadTokens: 300,
+      cacheCreationTokens: 100,
+      reasoningTokens: 50,
+      costUsdTicks: 250_000_000,
+    },
+  },
+  numTurns: 1,
+  usageIsIncomplete: false,
+};
+
 test('pins and synthesizes the official 1.0.0 private wire contract', () => {
+  assert.equal(runtimeManifest.officialRuntime.minimumSupportedVersion, '1.0.0');
+  assert.deepEqual(
+    {
+      sessionUpdateNotification: runtimeManifest.privateWireContract.sessionUpdateNotification,
+      turnCompletedUpdate: runtimeManifest.privateWireContract.turnCompletedUpdate,
+      sessionInfoRequest: runtimeManifest.privateWireContract.sessionInfoRequest,
+      billingRequest: runtimeManifest.privateWireContract.billingRequest,
+      lodyUsageNotification: runtimeManifest.privateWireContract.lodyUsageNotification,
+      lodyRateLimitsNotification: runtimeManifest.privateWireContract.lodyRateLimitsNotification,
+    },
+    {
+      sessionUpdateNotification: 'x.ai/session/update',
+      turnCompletedUpdate: 'turn_completed',
+      sessionInfoRequest: 'x.ai/session/info',
+      billingRequest: 'x.ai/billing',
+      lodyUsageNotification: 'acp_ext:session_usage_update',
+      lodyRateLimitsNotification: 'acp_ext:session_rate_limits',
+    }
+  );
   const { response } = readyProxy();
   assert.deepEqual(
     response.result.configOptions.map((option) => option.id),
@@ -59,7 +106,13 @@ test('pins and synthesizes the official 1.0.0 private wire contract', () => {
     response.result.configOptions
       .find((option) => option.id === 'permission_mode')
       .options.map((option) => option.value),
-    ['ask', 'always-approve']
+    ['ask', 'auto', 'always-approve']
+  );
+  assert.deepEqual(
+    response.result.configOptions
+      .find((option) => option.id === 'interaction_mode')
+      .options.map((option) => option.value),
+    ['agent', 'plan']
   );
 });
 
@@ -84,7 +137,7 @@ test('maps every permission mode to the official notification contract', () => {
   });
 });
 
-test('optimistically syncs ask and always-approve without forwarding set_config_option', () => {
+test('optimistically syncs permission modes over the private extension notification', () => {
   const { proxy } = readyProxy();
   const output = proxy.handleClient({
     jsonrpc: '2.0',
@@ -97,7 +150,7 @@ test('optimistically syncs ask and always-approve without forwarding set_config_
     },
   });
   assert.equal(output.toRuntime.length, 1);
-  assert.equal(output.toRuntime[0].method, 'x.ai/yolo_mode_changed');
+  assert.equal(output.toRuntime[0].method, '_x.ai/yolo_mode_changed');
   assert.equal(output.toRuntime[0].params.clientIdentifier, clientIdentifier);
   assert.equal(
     output.toClient[0].result.configOptions.find((option) => option.id === 'permission_mode')
@@ -106,7 +159,7 @@ test('optimistically syncs ask and always-approve without forwarding set_config_
   );
 });
 
-test('gracefully rejects auto while the pinned runtime gate cannot be confirmed', () => {
+test('exposes experimental auto permission mode', () => {
   const { proxy } = readyProxy();
   const output = proxy.handleClient({
     jsonrpc: '2.0',
@@ -118,8 +171,90 @@ test('gracefully rejects auto while the pinned runtime gate cannot be confirmed'
       value: 'auto',
     },
   });
-  assert.equal(output.toRuntime.length, 0);
-  assert.equal(output.toClient[0].error.code, -32602);
+  assert.equal(output.toRuntime[0].method, '_x.ai/yolo_mode_changed');
+  assert.deepEqual(output.toRuntime[0].params, {
+    clientIdentifier,
+    permission_mode: 'auto',
+    yolo_mode: false,
+    auto_mode: true,
+  });
+  assert.equal(
+    output.toClient[0].result.configOptions.find((option) => option.id === 'permission_mode')
+      .currentValue,
+    'auto'
+  );
+});
+
+test('passes Grok native ACP permission requests and responses through unchanged', () => {
+  const { proxy } = readyProxy();
+  const request = {
+    jsonrpc: '2.0',
+    id: 77,
+    method: 'session/request_permission',
+    params: {
+      sessionId: 'grok-session',
+      toolCall: { toolCallId: 'write-1', title: 'Write file', kind: 'edit' },
+      options: [
+        { optionId: 'allow-once', name: 'Yes', kind: 'allow_once' },
+        { optionId: 'reject-once', name: 'No', kind: 'reject_once' },
+      ],
+    },
+  };
+  assert.deepEqual(proxy.handleRuntime(request), { toRuntime: [], toClient: [request] });
+
+  const response = {
+    jsonrpc: '2.0',
+    id: 77,
+    result: { outcome: { outcome: 'selected', optionId: 'reject-once' } },
+  };
+  assert.deepEqual(proxy.handleClient(response), { toRuntime: [response], toClient: [] });
+});
+
+test('safely degrades a legacy Ask interaction selection to Plan across response ordering', () => {
+  const { proxy } = readyProxy();
+  const request = proxy.handleClient({
+    jsonrpc: '2.0',
+    id: 31,
+    method: 'session/set_config_option',
+    params: { sessionId: 'grok-session', configId: 'interaction_mode', value: 'ask' },
+  }).toRuntime[0];
+  assert.deepEqual(request, {
+    jsonrpc: '2.0',
+    id: 31,
+    method: 'session/set_mode',
+    params: { sessionId: 'grok-session', modeId: 'plan' },
+  });
+  proxy.handleRuntime({
+    jsonrpc: '2.0',
+    method: 'session/update',
+    params: {
+      sessionId: 'grok-session',
+      update: { sessionUpdate: 'current_mode_update', currentModeId: 'plan' },
+    },
+  });
+  const modeResponse = proxy.handleRuntime({ jsonrpc: '2.0', id: 31, result: {} }).toClient[0];
+  assert.equal(
+    modeResponse.result.configOptions.find((option) => option.id === 'interaction_mode')
+      .currentValue,
+    'plan'
+  );
+  const response = proxy.handleClient({
+    jsonrpc: '2.0',
+    id: 32,
+    method: 'session/set_config_option',
+    params: { sessionId: 'grok-session', configId: 'reasoning_effort', value: 'low' },
+  });
+  const configResponse = proxy.handleRuntime({
+    jsonrpc: '2.0',
+    id: 32,
+    result: {},
+  }).toClient[0];
+  assert.equal(
+    configResponse.result.configOptions.find((option) => option.id === 'interaction_mode')
+      .currentValue,
+    'plan'
+  );
+  assert.equal(response.toRuntime[0].method, 'session/set_model');
 });
 
 test('translates reasoning effort through set_model and preserves the model id', () => {
@@ -208,9 +343,42 @@ test('restores optimistic permission state across session reload in the same wra
   );
 });
 
+test('preserves client-scoped permission state for a fresh replacement session', () => {
+  const { proxy } = readyProxy();
+  proxy.handleClient({
+    jsonrpc: '2.0',
+    id: 8,
+    method: 'session/set_config_option',
+    params: {
+      sessionId: 'grok-session',
+      configId: 'permission_mode',
+      value: 'always-approve',
+    },
+  });
+  proxy.handleClient({
+    jsonrpc: '2.0',
+    id: 9,
+    method: 'session/new',
+    params: {
+      cwd: '/tmp/project',
+      mcpServers: [],
+      _meta: { clientIdentifier },
+    },
+  });
+  const replacement = proxy.handleRuntime({
+    ...sessionResponse,
+    id: 9,
+    result: { ...sessionResponse.result, sessionId: 'grok-session-2' },
+  }).toClient[0];
+  assert.equal(
+    replacement.result.configOptions.find((option) => option.id === 'permission_mode').currentValue,
+    'always-approve'
+  );
+});
+
 test('tracks the official snake_case model_changed notification', () => {
   const { proxy } = readyProxy();
-  proxy.handleRuntime({
+  const modelChanged = proxy.handleRuntime({
     jsonrpc: '2.0',
     method: 'x.ai/session_notification',
     params: {
@@ -222,6 +390,7 @@ test('tracks the official snake_case model_changed notification', () => {
       },
     },
   });
+  assert.equal(modelChanged.toRuntime[0].method, '_x.ai/session/info');
   const request = proxy.handleClient({
     jsonrpc: '2.0',
     id: 8,
@@ -229,4 +398,340 @@ test('tracks the official snake_case model_changed notification', () => {
     params: { sessionId: 'grok-session', configId: 'reasoning_effort', value: 'high' },
   }).toRuntime[0];
   assert.equal(request.params.modelId, 'grok-4');
+});
+
+test('normalizes official inclusive token counters into Lody disjoint usage buckets', () => {
+  assert.deepEqual(normalizePromptUsage(promptUsage), {
+    usage: {
+      inputTokens: 600,
+      outputTokens: 200,
+      cacheReadInputTokens: 300,
+      cacheCreationInputTokens: 100,
+      reasoningOutputTokens: 50,
+      costUSD: 0.025,
+    },
+    modelUsage: {
+      'grok-build': {
+        inputTokens: 600,
+        outputTokens: 200,
+        cacheReadInputTokens: 300,
+        cacheCreationInputTokens: 100,
+        reasoningOutputTokens: 50,
+        costUSD: 0.025,
+      },
+    },
+  });
+});
+
+test('drops untrustworthy costs while preserving incomplete token usage', () => {
+  const normalized = normalizePromptUsage({
+    ...promptUsage,
+    usageIsIncomplete: true,
+    modelUsage: {
+      'grok-build': { ...promptUsage.modelUsage['grok-build'], costIsPartial: true },
+    },
+  });
+  assert.equal(normalized.usage.costUSD, undefined);
+  assert.equal(normalized.modelUsage['grok-build'].costUSD, undefined);
+  assert.equal(normalized.usage.inputTokens, 600);
+});
+
+test('emits Lody token usage and requests authoritative context on turn completion', () => {
+  const { proxy } = readyProxy();
+  const output = proxy.handleRuntime({
+    jsonrpc: '2.0',
+    method: '_x.ai/session/update',
+    params: {
+      sessionId: 'grok-session',
+      update: {
+        sessionUpdate: 'turn_completed',
+        prompt_id: 'prompt-1',
+        stop_reason: 'end_turn',
+        usage: promptUsage,
+      },
+    },
+  });
+
+  assert.equal(output.toClient[0].method, '_x.ai/session/update');
+  assert.equal(output.toClient[1].method, '_acp_ext:session_usage_update');
+  assert.deepEqual(output.toClient[1].params, normalizePromptUsage(promptUsage));
+  assert.equal(output.toRuntime.length, 2);
+  assert.equal(output.toRuntime[0].method, '_x.ai/session/info');
+  assert.deepEqual(output.toRuntime[0].params, { sessionId: 'grok-session' });
+  assert.equal(output.toRuntime[1].method, '_x.ai/billing');
+  assert.deepEqual(output.toRuntime[1].params, {});
+});
+
+test('converts session info context into standard ACP usage_update for the existing UI', () => {
+  const { proxy, startup } = readyProxy();
+  assert.equal(startup.toRuntime.length, 2);
+  assert.equal(startup.toRuntime[0].method, '_x.ai/session/info');
+
+  const output = proxy.handleRuntime({
+    jsonrpc: '2.0',
+    id: startup.toRuntime[0].id,
+    result: {
+      result: {
+        sessionId: 'grok-session',
+        context: { used: 81_920, total: 256_000, freeTokens: 174_080, usagePct: 32 },
+      },
+    },
+  });
+
+  assert.equal(output.toRuntime.length, 0);
+  assert.deepEqual(output.toClient, [
+    {
+      jsonrpc: '2.0',
+      method: 'session/update',
+      params: {
+        sessionId: 'grok-session',
+        update: { sessionUpdate: 'usage_update', size: 256_000, used: 81_920 },
+      },
+    },
+  ]);
+});
+
+test('converts official Grok billing into Lody session rate limits', () => {
+  const { proxy, startup } = readyProxy();
+  const billingRequest = startup.toRuntime.find((message) => message.method === '_x.ai/billing');
+  assert.ok(billingRequest);
+
+  const billing = {
+    config: {
+      creditUsagePercent: 42.5,
+      currentPeriod: {
+        type: 'USAGE_PERIOD_TYPE_WEEKLY',
+        start: '2026-06-01T00:00:00Z',
+        end: '2026-06-08T00:00:00Z',
+      },
+      onDemandCap: { val: 5_000 },
+      onDemandUsed: { val: 300 },
+      prepaidBalance: { val: 1_250 },
+    },
+    on_demand_enabled: true,
+    subscription_tier: 'SuperGrok Heavy',
+  };
+  const expected = {
+    schemaVersion: 2,
+    planName: 'SuperGrok Heavy',
+    limitName: 'Grok Build',
+    limitId: 'grok',
+    windows: [
+      {
+        usedPercent: 42.5,
+        windowDurationMins: 7 * 24 * 60,
+        resetsAt: Date.parse('2026-06-08T00:00:00Z'),
+      },
+    ],
+    fiveHour: null,
+    sevenDay: 42.5,
+    fiveHourResetAt: null,
+    sevenDayResetAt: Date.parse('2026-06-08T00:00:00Z'),
+  };
+  assert.deepEqual(normalizeBillingRateLimits(billing), expected);
+
+  const output = proxy.handleRuntime({
+    jsonrpc: '2.0',
+    id: billingRequest.id,
+    result: billing,
+  });
+  assert.deepEqual(output, {
+    toRuntime: [],
+    toClient: [
+      {
+        jsonrpc: '2.0',
+        method: '_acp_ext:session_rate_limits',
+        params: expected,
+      },
+    ],
+  });
+});
+
+test('falls back to legacy Grok billing totals and clears stale limits on billing errors', () => {
+  assert.equal(
+    normalizeBillingRateLimits({
+      config: { monthlyLimit: { val: 2_000 }, used: { val: 500 } },
+    }).windows[0].usedPercent,
+    25
+  );
+
+  const { proxy, startup } = readyProxy();
+  const billingRequest = startup.toRuntime.find((message) => message.method === '_x.ai/billing');
+  const output = proxy.handleRuntime({
+    jsonrpc: '2.0',
+    id: billingRequest.id,
+    error: { code: -32603, message: 'Billing unavailable' },
+  });
+  assert.deepEqual(output, {
+    toRuntime: [],
+    toClient: [
+      {
+        jsonrpc: '2.0',
+        method: '_acp_ext:session_rate_limits',
+        params: {
+          schemaVersion: 2,
+          planName: null,
+          limitName: 'Grok Build',
+          limitId: 'grok',
+          windows: [],
+          fiveHour: null,
+          sevenDay: null,
+          fiveHourResetAt: null,
+          sevenDayResetAt: null,
+          apiUnavailable: true,
+        },
+      },
+    ],
+  });
+});
+
+test('matches the official Grok TUI zero-percent fallback for fresh unified billing', () => {
+  assert.deepEqual(
+    normalizeBillingRateLimits({
+      config: {
+        currentPeriod: {
+          type: 'USAGE_PERIOD_TYPE_WEEKLY',
+          start: '2026-08-09T09:12:56Z',
+          end: '2026-08-16T09:12:56Z',
+        },
+        onDemandCap: { val: 0 },
+        onDemandUsed: { val: 0 },
+        prepaidBalance: { val: 0 },
+        isUnifiedBillingUser: true,
+      },
+      subscription_tier: 'X Premium+',
+    }),
+    {
+      schemaVersion: 2,
+      planName: 'X Premium+',
+      limitName: 'Grok Build',
+      limitId: 'grok',
+      windows: [
+        {
+          usedPercent: 0,
+          windowDurationMins: 7 * 24 * 60,
+          resetsAt: Date.parse('2026-08-16T09:12:56Z'),
+        },
+      ],
+      fiveHour: null,
+      sevenDay: 0,
+      fiveHourResetAt: null,
+      sevenDayResetAt: Date.parse('2026-08-16T09:12:56Z'),
+    }
+  );
+});
+
+test('keeps genuinely incomplete billing visible without inventing utilization', () => {
+  const limits = normalizeBillingRateLimits({
+    config: {
+      currentPeriod: {
+        type: 'USAGE_PERIOD_TYPE_WEEKLY',
+        start: '2026-08-09T09:12:56Z',
+        end: '2026-08-16T09:12:56Z',
+      },
+      isUnifiedBillingUser: true,
+    },
+    subscription_tier: 'X Premium+',
+  });
+  assert.equal(limits.apiUnavailable, true);
+  assert.deepEqual(limits.windows, []);
+});
+
+test('does not pair historical utilization with the current billing period', () => {
+  const limits = normalizeBillingRateLimits({
+    config: {
+      currentPeriod: {
+        type: 'USAGE_PERIOD_TYPE_WEEKLY',
+        start: '2026-08-16T00:00:00Z',
+        end: '2026-08-23T00:00:00Z',
+      },
+      history: [
+        {
+          type: 'USAGE_PERIOD_TYPE_WEEKLY',
+          start: '2026-08-09T00:00:00Z',
+          end: '2026-08-16T00:00:00Z',
+          creditUsagePercent: 87,
+        },
+      ],
+    },
+    subscription_tier: 'SuperGrok',
+  });
+  assert.equal(limits.apiUnavailable, true);
+  assert.deepEqual(limits.windows, []);
+});
+
+test('derives utilization from official billing history totals', () => {
+  const limits = normalizeBillingRateLimits({
+    config: {
+      history: [
+        {
+          type: 'USAGE_PERIOD_TYPE_WEEKLY',
+          start: '2026-08-09T00:00:00Z',
+          end: '2026-08-16T00:00:00Z',
+          monthlyLimit: { val: 1_000 },
+          totalUsed: { val: 250 },
+        },
+      ],
+    },
+    subscription_tier: 'SuperGrok',
+  });
+  assert.equal(limits.windows[0].usedPercent, 25);
+  assert.equal(limits.windows[0].windowDurationMins, 7 * 24 * 60);
+});
+
+test('uses prompt response usage as a fallback and deduplicates turn_completed', () => {
+  const { proxy } = readyProxy();
+  proxy.handleClient({
+    jsonrpc: '2.0',
+    id: 20,
+    method: 'session/prompt',
+    params: { sessionId: 'grok-session', prompt: [] },
+  });
+  const promptResponse = proxy.handleRuntime({
+    jsonrpc: '2.0',
+    id: 20,
+    result: {
+      stopReason: 'end_turn',
+      _meta: { sessionId: 'grok-session', promptId: 'prompt-2', usage: promptUsage },
+    },
+  });
+  assert.equal(promptResponse.toClient[1].method, '_acp_ext:session_usage_update');
+  assert.equal(promptResponse.toRuntime[0].method, '_x.ai/session/info');
+  assert.equal(promptResponse.toRuntime[1].method, '_x.ai/billing');
+
+  const durableCompletion = proxy.handleRuntime({
+    jsonrpc: '2.0',
+    method: '_x.ai/session/update',
+    params: {
+      sessionId: 'grok-session',
+      update: {
+        sessionUpdate: 'turn_completed',
+        prompt_id: 'prompt-2',
+        stop_reason: 'end_turn',
+        usage: promptUsage,
+      },
+    },
+  });
+  assert.equal(durableCompletion.toClient.length, 1);
+  assert.equal(durableCompletion.toRuntime.length, 0);
+});
+
+test('does not record or re-query historical usage from replayed completions', () => {
+  const { proxy } = readyProxy();
+  const replay = proxy.handleRuntime({
+    jsonrpc: '2.0',
+    method: '_x.ai/session/update',
+    params: {
+      sessionId: 'grok-session',
+      update: {
+        sessionUpdate: 'turn_completed',
+        prompt_id: 'old-prompt',
+        stop_reason: 'end_turn',
+        usage: promptUsage,
+      },
+      _meta: { isReplay: true },
+    },
+  });
+  assert.equal(replay.toClient.length, 1);
+  assert.equal(replay.toRuntime.length, 0);
 });

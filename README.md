@@ -10,15 +10,31 @@ configuration options.
 Supported configuration:
 
 - Permission mode maps to `x.ai/yolo_mode_changed` with the current Lody
-  `clientIdentifier`.
+  `clientIdentifier`, which is registered during ACP initialization. Grok's
+  native standard `session/request_permission` requests pass through unchanged.
 - Reasoning effort maps to `session/set_model`, preserving the current model and
   setting `_meta.reasoningEffort`.
 - Model and interaction mode map to the corresponding standard legacy ACP calls.
+  Grok 1.0.0 reliably supports Agent and Plan. It silently ignores Ask, so the
+  adapter does not advertise Ask and maps legacy persisted Ask selections to
+  Plan.
+- Per-turn token and trusted cost totals from Grok's prompt metadata or durable
+  `_x.ai/session/update` `turn_completed` event map to Lody's
+  `acp_ext:session_usage_update` extension. Cache and reasoning totals are
+  converted from Grok's inclusive counters into Lody's disjoint buckets.
+- The adapter queries `x.ai/session/info` after session setup and completed
+  prompts, then emits standard ACP `usage_update` context-window updates. Replay
+  events never re-record historical billing usage.
+- The adapter queries `x.ai/billing` after session setup and completed prompts,
+  then maps the official credit usage percentage and billing period to Lody's
+  `acp_ext:session_rate_limits` extension. For the fresh unified-billing shape
+  where Grok explicitly returns zero cap, usage, and balance but omits the
+  percentage, the adapter mirrors the official `/usage` UI's weekly `0%`.
+  Billing failures never fail a session.
 
-The official 1.0.0 runtime does not expose an acknowledgement or a dependable
-feature-gate signal for automatic permission mode. The mapping is covered by
-contract tests, but the option remains hidden until a pinned official runtime
-can advertise that capability.
+Automatic permission mode is exposed as an experimental option. The official
+1.0.0 runtime accepts the private `auto_mode` notification but does not
+acknowledge it, so the adapter applies the selection optimistically.
 
 Run with:
 

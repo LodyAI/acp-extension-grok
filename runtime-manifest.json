@@ -8,7 +8,14 @@
     "permissionNotification": "x.ai/yolo_mode_changed",
     "sessionConfigMeta": "x.ai/sessionConfig",
     "sessionNotification": "x.ai/session_notification",
+    "sessionUpdateNotification": "x.ai/session/update",
+    "turnCompletedUpdate": "turn_completed",
+    "sessionInfoRequest": "x.ai/session/info",
+    "billingRequest": "x.ai/billing",
+    "weeklyUsagePeriodType": "USAGE_PERIOD_TYPE_WEEKLY",
+    "lodyUsageNotification": "acp_ext:session_usage_update",
+    "lodyRateLimitsNotification": "acp_ext:session_rate_limits",
     "reasoningEffortMeta": "reasoningEffort",
-    "autoPermissionMode": false
+    "autoPermissionMode": true
   }
 }
