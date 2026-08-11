@@ -12,6 +12,97 @@ const PERMISSION_MODES = {
 
 const INTERACTION_TO_RUNTIME = { agent: 'default', plan: 'plan', ask: 'ask' };
 const INTERACTION_FROM_RUNTIME = { default: 'agent', plan: 'plan', ask: 'ask' };
+const USD_TICKS_PER_USD = 10_000_000_000;
+const MAX_TRACKED_PROMPTS = 256;
+
+function logicalExtensionMethod(method) {
+  return typeof method === 'string' && method.startsWith('_') ? method.slice(1) : method;
+}
+
+function wireExtensionMethod(method) {
+  return method.startsWith('_') ? method : `_${method}`;
+}
+
+function nonnegativeNumber(value) {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : 0;
+}
+
+function normalizeUsageModel(usage, usageIsIncomplete) {
+  const inputTokens = nonnegativeNumber(usage?.inputTokens);
+  const outputTokens = nonnegativeNumber(usage?.outputTokens);
+  const cacheReadInputTokens = nonnegativeNumber(usage?.cachedReadTokens);
+  const cacheCreationInputTokens = nonnegativeNumber(usage?.cacheCreationTokens);
+  const reasoningOutputTokens = nonnegativeNumber(usage?.reasoningTokens);
+  const costUsdTicks = usage?.costUsdTicks;
+  const hasTrustworthyCost =
+    !usageIsIncomplete &&
+    usage?.costIsPartial !== true &&
+    typeof costUsdTicks === 'number' &&
+    Number.isFinite(costUsdTicks) &&
+    costUsdTicks >= 0;
+
+  return {
+    // Grok's ACP totals include cache buckets in inputTokens and reasoning in
+    // outputTokens. Lody stores disjoint buckets and adds them for reporting.
+    inputTokens: Math.max(0, inputTokens - cacheReadInputTokens - cacheCreationInputTokens),
+    outputTokens: Math.max(0, outputTokens - reasoningOutputTokens),
+    cacheReadInputTokens,
+    cacheCreationInputTokens,
+    reasoningOutputTokens,
+    ...(hasTrustworthyCost ? { costUSD: costUsdTicks / USD_TICKS_PER_USD } : {}),
+  };
+}
+
+export function normalizePromptUsage(promptUsage) {
+  if (!promptUsage || typeof promptUsage !== 'object') return undefined;
+  const usageIsIncomplete = promptUsage.usageIsIncomplete === true;
+  const usage = normalizeUsageModel(promptUsage, usageIsIncomplete);
+  const modelUsage = {};
+  if (promptUsage.modelUsage && typeof promptUsage.modelUsage === 'object') {
+    for (const [modelId, model] of Object.entries(promptUsage.modelUsage)) {
+      if (model && typeof model === 'object') {
+        modelUsage[modelId] = normalizeUsageModel(model, usageIsIncomplete);
+      }
+    }
+  }
+  return {
+    usage,
+    ...(Object.keys(modelUsage).length ? { modelUsage } : {}),
+  };
+}
+
+function usageNotification(promptUsage) {
+  const params = normalizePromptUsage(promptUsage);
+  if (!params) return undefined;
+  return {
+    jsonrpc: '2.0',
+    method: wireExtensionMethod(runtimeManifest.privateWireContract.lodyUsageNotification),
+    params,
+  };
+}
+
+function contextUsageNotification(sessionId, context) {
+  const size = nonnegativeNumber(context?.total);
+  const used = nonnegativeNumber(context?.used);
+  if (size <= 0) return undefined;
+  return {
+    jsonrpc: '2.0',
+    method: 'session/update',
+    params: {
+      sessionId,
+      update: { sessionUpdate: 'usage_update', size, used },
+    },
+  };
+}
+
+function rememberPrompt(set, promptId) {
+  if (!promptId || set.has(promptId)) return false;
+  set.add(promptId);
+  if (set.size > MAX_TRACKED_PROMPTS) {
+    set.delete(set.values().next().value);
+  }
+  return true;
+}
 
 function errorResponse(id, message) {
   return { jsonrpc: '2.0', id, error: { code: -32602, message } };
@@ -61,6 +152,32 @@ export class GrokAcpCompatibilityProxy {
   constructor() {
     this.sessions = new Map();
     this.pending = new Map();
+    this.nextInternalRequestId = Number.MAX_SAFE_INTEGER;
+  }
+
+  internalRequest(kind, sessionId) {
+    while (this.pending.has(this.nextInternalRequestId)) this.nextInternalRequestId -= 1;
+    const id = this.nextInternalRequestId;
+    this.nextInternalRequestId -= 1;
+    this.pending.set(id, { kind, sessionId });
+    return {
+      jsonrpc: '2.0',
+      id,
+      method: wireExtensionMethod(runtimeManifest.privateWireContract.sessionInfoRequest),
+      params: { sessionId },
+    };
+  }
+
+  contextRequestForPrompt(state, promptId) {
+    if (promptId && !rememberPrompt(state.contextPromptIds, promptId)) return undefined;
+    return this.internalRequest('context', state.sessionId);
+  }
+
+  usageForPrompt(state, promptId, promptUsage) {
+    const notification = usageNotification(promptUsage);
+    if (!notification) return undefined;
+    if (promptId && !rememberPrompt(state.usagePromptIds, promptId)) return undefined;
+    return notification;
   }
 
   handleClient(message) {
@@ -78,6 +195,15 @@ export class GrokAcpCompatibilityProxy {
           method: message.method,
           sessionId: params.sessionId,
           clientIdentifier,
+        });
+      }
+      return { toRuntime: [message], toClient: [] };
+    }
+    if (message.method === 'session/prompt') {
+      if (message.id !== undefined) {
+        this.pending.set(message.id, {
+          kind: 'prompt',
+          sessionId: params.sessionId,
         });
       }
       return { toRuntime: [message], toClient: [] };
@@ -183,7 +309,31 @@ export class GrokAcpCompatibilityProxy {
 
   handleRuntime(message) {
     if (!message || typeof message !== 'object') return { toRuntime: [], toClient: [message] };
-    if (message.method === runtimeManifest.privateWireContract.sessionNotification) {
+    const logicalMethod = logicalExtensionMethod(message.method);
+    if (logicalMethod === runtimeManifest.privateWireContract.sessionUpdateNotification) {
+      const sessionId = message.params?.sessionId;
+      const update = message.params?.update;
+      const state = this.sessions.get(sessionId);
+      if (
+        state &&
+        update?.sessionUpdate === runtimeManifest.privateWireContract.turnCompletedUpdate
+      ) {
+        const promptId = update.prompt_id ?? update.promptId;
+        const isReplay = message.params?._meta?.isReplay === true;
+        const toRuntime = [];
+        const toClient = [message];
+        if (!isReplay) {
+          const usage = this.usageForPrompt(state, promptId, update.usage);
+          if (usage) toClient.push(usage);
+          const contextRequest = this.contextRequestForPrompt(state, promptId);
+          if (contextRequest) toRuntime.push(contextRequest);
+        }
+        return { toRuntime, toClient };
+      }
+      return { toRuntime: [], toClient: [message] };
+    }
+
+    if (logicalMethod === runtimeManifest.privateWireContract.sessionNotification) {
       const sessionId = message.params?.sessionId;
       const update = message.params?.update;
       const state = this.sessions.get(sessionId);
@@ -192,13 +342,37 @@ export class GrokAcpCompatibilityProxy {
         const reasoningEffort = update.reasoning_effort ?? update.reasoningEffort;
         if (typeof modelId === 'string') state.currentModelId = modelId;
         if (typeof reasoningEffort === 'string') state.reasoningEffort = reasoningEffort;
+        return {
+          toRuntime: [this.internalRequest('context', sessionId)],
+          toClient: [message],
+        };
       }
+      return { toRuntime: [], toClient: [message] };
+    }
+
+    // JSON-RPC request IDs are scoped independently in each direction. Never
+    // mistake a reverse request from Grok for a response to a Lody request that
+    // happens to use the same numeric ID.
+    if (typeof message.method === 'string') {
       return { toRuntime: [], toClient: [message] };
     }
 
     const pending = this.pending.get(message.id);
     if (!pending) return { toRuntime: [], toClient: [message] };
     this.pending.delete(message.id);
+
+    if (pending.kind === 'context') {
+      if (message.error) return { toRuntime: [], toClient: [] };
+      const contextNotification = contextUsageNotification(
+        pending.sessionId,
+        message.result?.context
+      );
+      return {
+        toRuntime: [],
+        toClient: contextNotification ? [contextNotification] : [],
+      };
+    }
+
     if (message.error) return { toRuntime: [], toClient: [message] };
 
     if (pending.kind === 'session') {
@@ -208,13 +382,26 @@ export class GrokAcpCompatibilityProxy {
       const state = this.stateFromSessionResponse(sessionId, pending.clientIdentifier, result);
       this.sessions.set(sessionId, state);
       return {
-        toRuntime: [],
+        toRuntime: [this.internalRequest('context', sessionId)],
         toClient: [
           {
             ...message,
             result: { ...result, configOptions: this.configOptions(state) },
           },
         ],
+      };
+    }
+
+    if (pending.kind === 'prompt') {
+      const state = this.sessions.get(pending.sessionId);
+      if (!state) return { toRuntime: [], toClient: [message] };
+      const meta = message.result?._meta;
+      const promptId = meta?.promptId ?? meta?.requestId;
+      const usage = this.usageForPrompt(state, promptId, meta?.usage);
+      const contextRequest = this.contextRequestForPrompt(state, promptId);
+      return {
+        toRuntime: contextRequest ? [contextRequest] : [],
+        toClient: usage ? [message, usage] : [message],
       };
     }
 
@@ -269,6 +456,8 @@ export class GrokAcpCompatibilityProxy {
         legacyEfforts.find((option) => option.selected)?.id ??
         old?.reasoningEffort ??
         reasoningEfforts[0],
+      usagePromptIds: old?.usagePromptIds ?? new Set(),
+      contextPromptIds: old?.contextPromptIds ?? new Set(),
     };
   }
 

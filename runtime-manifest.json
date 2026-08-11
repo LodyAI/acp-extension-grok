@@ -8,6 +8,10 @@
     "permissionNotification": "x.ai/yolo_mode_changed",
     "sessionConfigMeta": "x.ai/sessionConfig",
     "sessionNotification": "x.ai/session_notification",
+    "sessionUpdateNotification": "x.ai/session/update",
+    "turnCompletedUpdate": "turn_completed",
+    "sessionInfoRequest": "x.ai/session/info",
+    "lodyUsageNotification": "acp_ext:session_usage_update",
     "reasoningEffortMeta": "reasoningEffort",
     "autoPermissionMode": false
   }

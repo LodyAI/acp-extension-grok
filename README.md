@@ -14,6 +14,13 @@ Supported configuration:
 - Reasoning effort maps to `session/set_model`, preserving the current model and
   setting `_meta.reasoningEffort`.
 - Model and interaction mode map to the corresponding standard legacy ACP calls.
+- Per-turn token and trusted cost totals from Grok's prompt metadata or durable
+  `_x.ai/session/update` `turn_completed` event map to Lody's
+  `acp_ext:session_usage_update` extension. Cache and reasoning totals are
+  converted from Grok's inclusive counters into Lody's disjoint buckets.
+- The adapter queries `x.ai/session/info` after session setup and completed
+  prompts, then emits standard ACP `usage_update` context-window updates. Replay
+  events never re-record historical billing usage.
 
 The official 1.0.0 runtime does not expose an acknowledgement or a dependable
 feature-gate signal for automatic permission mode. The mapping is covered by
