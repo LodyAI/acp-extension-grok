@@ -108,6 +108,12 @@ test('pins and synthesizes the official 1.0.0 private wire contract', () => {
       .options.map((option) => option.value),
     ['ask', 'auto', 'always-approve']
   );
+  assert.deepEqual(
+    response.result.configOptions
+      .find((option) => option.id === 'interaction_mode')
+      .options.map((option) => option.value),
+    ['agent', 'plan']
+  );
 });
 
 test('maps every permission mode to the official notification contract', () => {
@@ -179,7 +185,32 @@ test('exposes experimental auto permission mode', () => {
   );
 });
 
-test('translates and tracks interaction mode changes', () => {
+test('passes Grok native ACP permission requests and responses through unchanged', () => {
+  const { proxy } = readyProxy();
+  const request = {
+    jsonrpc: '2.0',
+    id: 77,
+    method: 'session/request_permission',
+    params: {
+      sessionId: 'grok-session',
+      toolCall: { toolCallId: 'write-1', title: 'Write file', kind: 'edit' },
+      options: [
+        { optionId: 'allow-once', name: 'Yes', kind: 'allow_once' },
+        { optionId: 'reject-once', name: 'No', kind: 'reject_once' },
+      ],
+    },
+  };
+  assert.deepEqual(proxy.handleRuntime(request), { toRuntime: [], toClient: [request] });
+
+  const response = {
+    jsonrpc: '2.0',
+    id: 77,
+    result: { outcome: { outcome: 'selected', optionId: 'reject-once' } },
+  };
+  assert.deepEqual(proxy.handleClient(response), { toRuntime: [response], toClient: [] });
+});
+
+test('safely degrades a legacy Ask interaction selection to Plan across response ordering', () => {
   const { proxy } = readyProxy();
   const request = proxy.handleClient({
     jsonrpc: '2.0',
@@ -191,9 +222,8 @@ test('translates and tracks interaction mode changes', () => {
     jsonrpc: '2.0',
     id: 31,
     method: 'session/set_mode',
-    params: { sessionId: 'grok-session', modeId: 'ask' },
+    params: { sessionId: 'grok-session', modeId: 'plan' },
   });
-  proxy.handleRuntime({ jsonrpc: '2.0', id: 31, result: {} });
   proxy.handleRuntime({
     jsonrpc: '2.0',
     method: 'session/update',
@@ -202,6 +232,12 @@ test('translates and tracks interaction mode changes', () => {
       update: { sessionUpdate: 'current_mode_update', currentModeId: 'plan' },
     },
   });
+  const modeResponse = proxy.handleRuntime({ jsonrpc: '2.0', id: 31, result: {} }).toClient[0];
+  assert.equal(
+    modeResponse.result.configOptions.find((option) => option.id === 'interaction_mode')
+      .currentValue,
+    'plan'
+  );
   const response = proxy.handleClient({
     jsonrpc: '2.0',
     id: 32,
@@ -303,6 +339,39 @@ test('restores optimistic permission state across session reload in the same wra
   }).toClient[0];
   assert.equal(
     loaded.result.configOptions.find((option) => option.id === 'permission_mode').currentValue,
+    'always-approve'
+  );
+});
+
+test('preserves client-scoped permission state for a fresh replacement session', () => {
+  const { proxy } = readyProxy();
+  proxy.handleClient({
+    jsonrpc: '2.0',
+    id: 8,
+    method: 'session/set_config_option',
+    params: {
+      sessionId: 'grok-session',
+      configId: 'permission_mode',
+      value: 'always-approve',
+    },
+  });
+  proxy.handleClient({
+    jsonrpc: '2.0',
+    id: 9,
+    method: 'session/new',
+    params: {
+      cwd: '/tmp/project',
+      mcpServers: [],
+      _meta: { clientIdentifier },
+    },
+  });
+  const replacement = proxy.handleRuntime({
+    ...sessionResponse,
+    id: 9,
+    result: { ...sessionResponse.result, sessionId: 'grok-session-2' },
+  }).toClient[0];
+  assert.equal(
+    replacement.result.configOptions.find((option) => option.id === 'permission_mode').currentValue,
     'always-approve'
   );
 });

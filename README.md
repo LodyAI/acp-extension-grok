@@ -10,10 +10,14 @@ configuration options.
 Supported configuration:
 
 - Permission mode maps to `x.ai/yolo_mode_changed` with the current Lody
-  `clientIdentifier`.
+  `clientIdentifier`, which is registered during ACP initialization. Grok's
+  native standard `session/request_permission` requests pass through unchanged.
 - Reasoning effort maps to `session/set_model`, preserving the current model and
   setting `_meta.reasoningEffort`.
 - Model and interaction mode map to the corresponding standard legacy ACP calls.
+  Grok 1.0.0 reliably supports Agent and Plan. It silently ignores Ask, so the
+  adapter does not advertise Ask and maps legacy persisted Ask selections to
+  Plan.
 - Per-turn token and trusted cost totals from Grok's prompt metadata or durable
   `_x.ai/session/update` `turn_completed` event map to Lody's
   `acp_ext:session_usage_update` extension. Cache and reasoning totals are

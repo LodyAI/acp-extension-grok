@@ -10,8 +10,11 @@ const PERMISSION_MODES = {
   },
 };
 
-const INTERACTION_TO_RUNTIME = { agent: 'default', plan: 'plan', ask: 'ask' };
-const INTERACTION_FROM_RUNTIME = { default: 'agent', plan: 'plan', ask: 'ask' };
+// Grok 1.0.0 silently accepts `ask` without changing its runtime mode. Keep
+// legacy persisted Ask selections safe by degrading them to Plan, but do not
+// advertise Ask until the runtime reports and applies it.
+const INTERACTION_TO_RUNTIME = { agent: 'default', plan: 'plan', ask: 'plan' };
+const INTERACTION_FROM_RUNTIME = { default: 'agent', plan: 'plan', ask: 'plan' };
 const USD_TICKS_PER_USD = 10_000_000_000;
 const MAX_TRACKED_PROMPTS = 256;
 const FIVE_HOUR_WINDOW_MINS = 5 * 60;
@@ -374,7 +377,11 @@ export class GrokAcpCompatibilityProxy {
           ],
         };
       }
-      state.permissionMode = value;
+      for (const trackedState of this.sessions.values()) {
+        if (trackedState.clientIdentifier === state.clientIdentifier) {
+          trackedState.permissionMode = value;
+        }
+      }
       return {
         toRuntime: [notification],
         toClient: [
@@ -388,6 +395,7 @@ export class GrokAcpCompatibilityProxy {
     }
 
     let translated;
+    let effectiveValue = value;
     if (configId === 'reasoning_effort') {
       if (!state.currentModelId || !state.reasoningEfforts.includes(value)) {
         return {
@@ -415,6 +423,7 @@ export class GrokAcpCompatibilityProxy {
         params: { sessionId, modelId: value },
       };
     } else if (configId === 'interaction_mode' && INTERACTION_TO_RUNTIME[value]) {
+      effectiveValue = INTERACTION_FROM_RUNTIME[INTERACTION_TO_RUNTIME[value]] ?? value;
       translated = {
         jsonrpc: '2.0',
         id: message.id,
@@ -431,7 +440,7 @@ export class GrokAcpCompatibilityProxy {
       kind: 'config',
       sessionId,
       configId,
-      value,
+      value: effectiveValue,
     });
     return { toRuntime: [translated], toClient: [] };
   }
@@ -585,6 +594,12 @@ export class GrokAcpCompatibilityProxy {
 
   stateFromSessionResponse(sessionId, clientIdentifier, result) {
     const old = this.sessions.get(sessionId);
+    const clientPermissionState =
+      !old && typeof clientIdentifier === 'string' && clientIdentifier.length > 0
+        ? Array.from(this.sessions.values()).find(
+            (state) => state.clientIdentifier === clientIdentifier
+          )
+        : undefined;
     const legacy = legacyOptions(result);
     const legacyModels = legacy.filter((option) => option.category === 'model');
     const legacyEfforts = legacy.filter((option) => option.category === 'mode');
@@ -601,7 +616,7 @@ export class GrokAcpCompatibilityProxy {
     return {
       sessionId,
       clientIdentifier: clientIdentifier ?? old?.clientIdentifier,
-      permissionMode: old?.permissionMode ?? 'ask',
+      permissionMode: old?.permissionMode ?? clientPermissionState?.permissionMode ?? 'ask',
       interactionMode:
         INTERACTION_FROM_RUNTIME[result.modes?.currentModeId] ?? old?.interactionMode ?? 'agent',
       currentModelId,
@@ -633,11 +648,6 @@ export class GrokAcpCompatibilityProxy {
         value: 'plan',
         name: 'Plan',
         description: 'Plan without modifying the workspace',
-      },
-      {
-        value: 'ask',
-        name: 'Ask',
-        description: 'Answer without modifying the workspace',
       },
     ];
     const permissions = [
