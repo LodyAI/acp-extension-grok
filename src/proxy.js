@@ -95,6 +95,11 @@ function contextUsageNotification(sessionId, context) {
   };
 }
 
+function unwrapExtensionResult(result) {
+  if (!result || typeof result !== 'object') return result;
+  return Object.prototype.hasOwnProperty.call(result, 'result') ? result.result : result;
+}
+
 function rememberPrompt(set, promptId) {
   if (!promptId || set.has(promptId)) return false;
   set.add(promptId);
@@ -363,9 +368,10 @@ export class GrokAcpCompatibilityProxy {
 
     if (pending.kind === 'context') {
       if (message.error) return { toRuntime: [], toClient: [] };
+      const sessionInfo = unwrapExtensionResult(message.result);
       const contextNotification = contextUsageNotification(
         pending.sessionId,
-        message.result?.context
+        sessionInfo?.context
       );
       return {
         toRuntime: [],

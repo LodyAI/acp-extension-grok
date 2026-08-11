@@ -343,8 +343,10 @@ test('converts session info context into standard ACP usage_update for the exist
     jsonrpc: '2.0',
     id: startup.toRuntime[0].id,
     result: {
-      sessionId: 'grok-session',
-      context: { used: 81_920, total: 256_000, freeTokens: 174_080, usagePct: 32 },
+      result: {
+        sessionId: 'grok-session',
+        context: { used: 81_920, total: 256_000, freeTokens: 174_080, usagePct: 32 },
+      },
     },
   });
 
