@@ -1,7 +1,7 @@
 #!/usr/bin/env node
-import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { GrokAcpCompatibilityProxy } from './proxy.js';
+import { spawnGrokRuntime } from './runtime-process.js';
 
 const grokPath = process.env.GROK_PATH;
 if (!grokPath) {
@@ -9,10 +9,7 @@ if (!grokPath) {
   process.exit(1);
 }
 
-const child = spawn(grokPath, ['agent', 'stdio'], {
-  env: { ...process.env, GROK_DISABLE_AUTOUPDATER: '1' },
-  stdio: ['pipe', 'pipe', 'inherit'],
-});
+const child = spawnGrokRuntime(grokPath);
 const proxy = new GrokAcpCompatibilityProxy();
 
 function write(stream, message) {
