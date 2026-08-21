@@ -137,6 +137,104 @@ test('maps every permission mode to the official notification contract', () => {
   });
 });
 
+test('applies initial always-approve before forwarding session/new', () => {
+  const proxy = new GrokAcpCompatibilityProxy();
+  const output = proxy.handleClient({
+    jsonrpc: '2.0',
+    id: 1,
+    method: 'session/new',
+    params: {
+      cwd: '/tmp/project',
+      mcpServers: [],
+      _meta: {
+        clientIdentifier,
+        lody: {
+          sessionConfig: {
+            version: 1,
+            configOptionValues: { permission_mode: 'always-approve' },
+          },
+        },
+      },
+    },
+  });
+
+  assert.equal(output.toRuntime.length, 1);
+  assert.deepEqual(output.toRuntime[0].params._meta, {
+    clientIdentifier,
+    yoloMode: true,
+  });
+  const response = proxy.handleRuntime(sessionResponse).toClient[0];
+  assert.equal(
+    response.result.configOptions.find((option) => option.id === 'permission_mode').currentValue,
+    'always-approve'
+  );
+});
+
+test('applies initial always-approve to restored sessions', () => {
+  for (const method of ['session/load', 'session/resume']) {
+    const proxy = new GrokAcpCompatibilityProxy();
+    const output = proxy.handleClient({
+      jsonrpc: '2.0',
+      id: 1,
+      method,
+      params: {
+        sessionId: 'grok-session',
+        cwd: '/tmp/project',
+        mcpServers: [],
+        _meta: {
+          clientIdentifier,
+          lody: {
+            sessionConfig: {
+              version: 1,
+              configOptionValues: { permission_mode: 'always-approve' },
+            },
+          },
+        },
+      },
+    });
+    assert.equal(output.toRuntime[0].params._meta.yoloMode, true);
+    assert.equal(output.toRuntime[0].params._meta.lody, undefined);
+  }
+});
+
+test('maps initial ask and auto permission modes at the session boundary', () => {
+  for (const [permissionMode, expectedYoloMode, expectedRuntimeMessages] of [
+    ['ask', false, 1],
+    ['auto', false, 2],
+  ]) {
+    const proxy = new GrokAcpCompatibilityProxy();
+    const output = proxy.handleClient({
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'session/new',
+      params: {
+        cwd: '/tmp/project',
+        mcpServers: [],
+        _meta: {
+          clientIdentifier,
+          lody: {
+            sessionConfig: {
+              version: 1,
+              configOptionValues: { permission_mode: permissionMode },
+            },
+          },
+        },
+      },
+    });
+    assert.equal(output.toRuntime.length, expectedRuntimeMessages);
+    assert.equal(output.toRuntime.at(-1).params._meta.yoloMode, expectedYoloMode);
+    if (permissionMode === 'auto') {
+      assert.equal(output.toRuntime[0].method, '_x.ai/yolo_mode_changed');
+      assert.equal(output.toRuntime[0].params.auto_mode, true);
+    }
+    const response = proxy.handleRuntime(sessionResponse).toClient[0];
+    assert.equal(
+      response.result.configOptions.find((option) => option.id === 'permission_mode').currentValue,
+      permissionMode
+    );
+  }
+});
+
 test('optimistically syncs permission modes over the private extension notification', () => {
   const { proxy } = readyProxy();
   const output = proxy.handleClient({
