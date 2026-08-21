@@ -1,5 +1,4 @@
 import runtimeManifest from '../runtime-manifest.json' with { type: 'json' };
-import { readLodySessionConfigMeta } from 'acp-extension-core';
 
 const contract = runtimeManifest.privateWireContract;
 
@@ -275,10 +274,25 @@ function stripLodySessionConfig(meta) {
     : remainingMeta;
 }
 
+function readLodySessionConfigOption(meta, configId) {
+  if (!meta || typeof meta !== 'object') return undefined;
+  const sessionConfig = meta.lody?.sessionConfig;
+  if (
+    !sessionConfig ||
+    typeof sessionConfig !== 'object' ||
+    sessionConfig.version !== 1 ||
+    !sessionConfig.configOptionValues ||
+    typeof sessionConfig.configOptionValues !== 'object'
+  ) {
+    return undefined;
+  }
+  const value = sessionConfig.configOptionValues[configId];
+  return typeof value === 'string' || typeof value === 'boolean' ? value : undefined;
+}
+
 function translateSessionStart(message) {
   const params = message.params ?? {};
-  const sessionConfig = readLodySessionConfigMeta(params._meta);
-  const permissionMode = sessionConfig?.configOptionValues.permission_mode;
+  const permissionMode = readLodySessionConfigOption(params._meta, 'permission_mode');
   const mapped = typeof permissionMode === 'string' ? PERMISSION_MODES[permissionMode] : undefined;
   if (!mapped) return { message, permissionMode: undefined, notification: undefined };
 
