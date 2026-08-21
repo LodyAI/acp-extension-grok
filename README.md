@@ -19,17 +19,18 @@ Supported configuration:
   adapter does not advertise Ask and maps legacy persisted Ask selections to
   Plan.
 - Per-turn token and trusted cost totals from Grok's prompt metadata or durable
-  `_x.ai/session/update` `turn_completed` event map to Lody's
-  `acp_ext:session_usage_update` extension. Cache and reasoning totals are
+  `_x.ai/session/update` `turn_completed` event map to Core's
+  `_lody/session/usage_update` extension. Cache and reasoning totals are
   converted from Grok's inclusive counters into Lody's disjoint buckets.
 - The adapter queries `x.ai/session/info` after session setup and completed
   prompts, then emits standard ACP `usage_update` context-window updates. Replay
   events never re-record historical billing usage.
 - The adapter queries `x.ai/billing` after session setup and completed prompts,
-  then maps the official credit usage percentage and billing period to Lody's
-  `acp_ext:session_rate_limits` extension. For the fresh unified-billing shape
-  where Grok explicitly returns zero cap, usage, and balance but omits the
-  percentage, the adapter mirrors the official `/usage` UI's weekly `0%`.
+  then maps the official credit usage percentage and billing period to Core's
+  `_lody/rate_limits/update` extension. Clients can also call
+  `_lody/rate_limits/get` independently of a session. For the fresh
+  unified-billing shape where Grok explicitly returns zero cap, usage, and balance
+  but omits the percentage, the adapter mirrors the official `/usage` UI's weekly `0%`.
   Billing failures never fail a session.
 
 Automatic permission mode is exposed as an experimental option. The official
