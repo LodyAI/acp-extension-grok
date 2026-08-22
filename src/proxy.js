@@ -1,4 +1,5 @@
 import runtimeManifest from '../runtime-manifest.json' with { type: 'json' };
+import { LODY_EXTENSION_METHODS } from 'acp-extension-core';
 
 const contract = runtimeManifest.privateWireContract;
 
@@ -22,12 +23,16 @@ const LEGACY_INTERACTION_ALIASES = { ask: 'plan' };
 const INTERNAL_REQUESTS = {
   context: { contractKey: 'sessionInfoRequest', params: (sessionId) => ({ sessionId }) },
   billing: { contractKey: 'billingRequest', params: () => ({}) },
+  rateLimits: { contractKey: 'billingRequest', params: () => ({}) },
 };
 
 const USD_TICKS_PER_USD = 10_000_000_000;
 const MAX_TRACKED_PROMPTS = 256;
-const FIVE_HOUR_WINDOW_MINS = 5 * 60;
-const SEVEN_DAY_WINDOW_MINS = 7 * 24 * 60;
+const GROK_LODY_CAPABILITIES = {
+  usage: { version: 1 },
+  rateLimits: { version: 1, query: true },
+};
+const SEVEN_DAY_WINDOW_SECONDS = 7 * 24 * 60 * 60;
 
 function logicalExtensionMethod(method) {
   return typeof method === 'string' && method.startsWith('_') ? method.slice(1) : method;
@@ -39,6 +44,10 @@ function wireExtensionMethod(method) {
 
 function extensionNotification(contractKey, params) {
   return { jsonrpc: '2.0', method: wireExtensionMethod(contract[contractKey]), params };
+}
+
+function lodyNotification(method, params) {
+  return { jsonrpc: '2.0', method, params };
 }
 
 function optionalNonnegativeNumber(value) {
@@ -85,20 +94,20 @@ function billingUsagePercent(config, period) {
 
 // A `window` of null means Grok could not tell us anything usable; Lody renders
 // that as unavailable rather than as zero utilization.
-function rateLimitsPayload(planName, window) {
-  const isFiveHour = window?.windowDurationMins === FIVE_HOUR_WINDOW_MINS;
-  const isSevenDay = window?.windowDurationMins === SEVEN_DAY_WINDOW_MINS;
+function rateLimitsPayload(planName, window, now = Date.now()) {
   return {
-    schemaVersion: 2,
-    planName,
-    limitName: 'Grok Build',
-    limitId: 'grok',
-    windows: window ? [window] : [],
-    fiveHour: isFiveHour ? window.usedPercent : null,
-    sevenDay: isSevenDay ? window.usedPercent : null,
-    fiveHourResetAt: isFiveHour ? window.resetsAt : null,
-    sevenDayResetAt: isSevenDay ? window.resetsAt : null,
-    ...(window ? {} : { apiUnavailable: true }),
+    rateLimits: window
+      ? [
+          {
+            limitId: 'grok',
+            scope: { providerId: 'grok' },
+            planName,
+            limitName: 'Grok Build',
+            windows: [window],
+          },
+        ]
+      : [],
+    fetchedAtEpochSeconds: Math.floor(now / 1_000),
   };
 }
 
@@ -142,9 +151,12 @@ export function normalizePromptUsage(promptUsage) {
   };
 }
 
-function usageNotification(promptUsage) {
+function usageNotification(sessionId, promptUsage) {
   const params = normalizePromptUsage(promptUsage);
-  return params && extensionNotification('lodyUsageNotification', params);
+  return (
+    params &&
+    lodyNotification(LODY_EXTENSION_METHODS.sessionUsageUpdate, { sessionId, ...params })
+  );
 }
 
 export function normalizeBillingRateLimits(billing) {
@@ -161,28 +173,33 @@ export function normalizeBillingRateLimits(billing) {
   const end = period?.end ?? period?.billingPeriodEnd ?? config.billingPeriodEnd;
   const startMs = typeof start === 'string' ? Date.parse(start) : Number.NaN;
   const endMs = typeof end === 'string' ? Date.parse(end) : Number.NaN;
-  const measuredWindowDurationMins =
+  const measuredWindowDurationSeconds =
     Number.isFinite(startMs) && Number.isFinite(endMs) && endMs > startMs
-      ? Math.round((endMs - startMs) / 60_000)
+      ? Math.round((endMs - startMs) / 1_000)
       : null;
-  const windowDurationMins =
+  const windowDurationSeconds =
     period?.type === contract.weeklyUsagePeriodType
-      ? SEVEN_DAY_WINDOW_MINS
-      : measuredWindowDurationMins;
-  const resetsAt = Number.isFinite(endMs) ? endMs : null;
+      ? SEVEN_DAY_WINDOW_SECONDS
+      : measuredWindowDurationSeconds;
+  const resetsAtEpochSeconds = Number.isFinite(endMs) ? Math.floor(endMs / 1_000) : null;
   const tier = billing.subscriptionTier ?? billing.subscription_tier;
   const planName = typeof tier === 'string' && tier.trim() ? tier : null;
 
   if (usedPercent === undefined) {
-    if (!planName && windowDurationMins === null && resetsAt === null) return undefined;
+    if (!planName && windowDurationSeconds === null && resetsAtEpochSeconds === null)
+      return undefined;
     return rateLimitsPayload(planName, null);
   }
-  return rateLimitsPayload(planName, { usedPercent, windowDurationMins, resetsAt });
+  return rateLimitsPayload(planName, {
+    usedPercent,
+    windowDurationSeconds,
+    resetsAtEpochSeconds,
+  });
 }
 
 function rateLimitsNotification(billing) {
   const params = normalizeBillingRateLimits(billing);
-  return params && extensionNotification('lodyRateLimitsNotification', params);
+  return params && lodyNotification(LODY_EXTENSION_METHODS.rateLimitsUpdate, params);
 }
 
 function contextUsageNotification(sessionId, context) {
@@ -327,11 +344,11 @@ export class GrokAcpCompatibilityProxy {
     this.nextInternalRequestId = Number.MAX_SAFE_INTEGER;
   }
 
-  internalRequest(kind, sessionId) {
+  internalRequest(kind, sessionId, responseId) {
     while (this.pending.has(this.nextInternalRequestId)) this.nextInternalRequestId -= 1;
     const id = this.nextInternalRequestId;
     this.nextInternalRequestId -= 1;
-    this.pending.set(id, { kind, sessionId });
+    this.pending.set(id, { kind, sessionId, responseId });
     const { contractKey, params } = INTERNAL_REQUESTS[kind];
     return {
       jsonrpc: '2.0',
@@ -351,7 +368,7 @@ export class GrokAcpCompatibilityProxy {
   }
 
   usageForPrompt(state, promptId, promptUsage) {
-    const notification = usageNotification(promptUsage);
+    const notification = usageNotification(state.sessionId, promptUsage);
     if (!notification) return undefined;
     if (!rememberPrompt(state.usagePromptIds, promptId)) return undefined;
     return notification;
@@ -360,6 +377,16 @@ export class GrokAcpCompatibilityProxy {
   handleClient(message) {
     if (!message || typeof message !== 'object') return { toRuntime: [message], toClient: [] };
     const params = message.params ?? {};
+    if (message.method === 'initialize' && message.id !== undefined) {
+      this.pending.set(message.id, { kind: 'initialize' });
+      return { toRuntime: [message], toClient: [] };
+    }
+    if (message.method === LODY_EXTENSION_METHODS.rateLimitsGet) {
+      return {
+        toRuntime: [this.internalRequest('rateLimits', undefined, message.id)],
+        toClient: [],
+      };
+    }
     if (
       message.method === 'session/new' ||
       message.method === 'session/load' ||
@@ -519,11 +546,49 @@ export class GrokAcpCompatibilityProxy {
 
     if (pending.kind === 'billing') {
       const notification = message.error
-        ? extensionNotification('lodyRateLimitsNotification', rateLimitsPayload(null, null))
+        ? lodyNotification(
+            LODY_EXTENSION_METHODS.rateLimitsUpdate,
+            rateLimitsPayload(null, null)
+          )
         : rateLimitsNotification(unwrapExtensionResult(message.result));
       return {
         toRuntime: [],
         toClient: notification ? [notification] : [],
+      };
+    }
+
+    if (pending.kind === 'rateLimits') {
+      const result = message.error
+        ? rateLimitsPayload(null, null)
+        : (normalizeBillingRateLimits(unwrapExtensionResult(message.result)) ??
+          rateLimitsPayload(null, null));
+      return {
+        toRuntime: [],
+        toClient: [{ jsonrpc: '2.0', id: pending.responseId, result }],
+      };
+    }
+
+    if (pending.kind === 'initialize') {
+      if (message.error) return { toRuntime: [], toClient: [message] };
+      const result = message.result ?? {};
+      const agentCapabilities = result.agentCapabilities ?? {};
+      return {
+        toRuntime: [],
+        toClient: [
+          {
+            ...message,
+            result: {
+              ...result,
+              agentCapabilities: {
+                ...agentCapabilities,
+                _meta: {
+                  ...(agentCapabilities._meta ?? {}),
+                  lody: GROK_LODY_CAPABILITIES,
+                },
+              },
+            },
+          },
+        ],
       };
     }
 
