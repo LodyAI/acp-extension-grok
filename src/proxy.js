@@ -280,6 +280,60 @@ export function permissionNotification(clientIdentifier, mode) {
   return extensionNotification('permissionNotification', { clientIdentifier, ...mapped });
 }
 
+function stripLodySessionConfig(meta) {
+  if (!meta || typeof meta !== 'object') return meta;
+  const lody = meta.lody;
+  if (!lody || typeof lody !== 'object' || !Object.hasOwn(lody, 'sessionConfig')) return meta;
+  const { sessionConfig: _sessionConfig, ...remainingLody } = lody;
+  const { lody: _lody, ...remainingMeta } = meta;
+  return Object.keys(remainingLody).length > 0
+    ? { ...remainingMeta, lody: remainingLody }
+    : remainingMeta;
+}
+
+function readLodySessionConfigOption(meta, configId) {
+  if (!meta || typeof meta !== 'object') return undefined;
+  const sessionConfig = meta.lody?.sessionConfig;
+  if (
+    !sessionConfig ||
+    typeof sessionConfig !== 'object' ||
+    sessionConfig.version !== 1 ||
+    !sessionConfig.configOptionValues ||
+    typeof sessionConfig.configOptionValues !== 'object'
+  ) {
+    return undefined;
+  }
+  const value = sessionConfig.configOptionValues[configId];
+  return typeof value === 'string' || typeof value === 'boolean' ? value : undefined;
+}
+
+function translateSessionStart(message) {
+  const params = message.params ?? {};
+  const permissionMode = readLodySessionConfigOption(params._meta, 'permission_mode');
+  const mapped = typeof permissionMode === 'string' ? PERMISSION_MODES[permissionMode] : undefined;
+  if (!mapped) return { message, permissionMode: undefined, notification: undefined };
+
+  const clientIdentifier = params._meta?.clientIdentifier;
+  const translated = {
+    ...message,
+    params: {
+      ...params,
+      _meta: {
+        ...stripLodySessionConfig(params._meta),
+        yoloMode: mapped.yolo_mode,
+      },
+    },
+  };
+  return {
+    message: translated,
+    permissionMode,
+    notification:
+      mapped.auto_mode && typeof clientIdentifier === 'string'
+        ? permissionNotification(clientIdentifier, permissionMode)
+        : undefined,
+  };
+}
+
 export class GrokAcpCompatibilityProxy {
   constructor() {
     this.sessions = new Map();
@@ -336,9 +390,14 @@ export class GrokAcpCompatibilityProxy {
     if (
       message.method === 'session/new' ||
       message.method === 'session/load' ||
-      message.method === 'session/resume'
+      message.method === 'session/resume' ||
+      message.method === 'session/fork'
     ) {
       const clientIdentifier = params._meta?.clientIdentifier;
+      const translated = translateSessionStart(message);
+      if (translated.permissionMode && typeof clientIdentifier === 'string') {
+        this.permissionModes.set(clientIdentifier, translated.permissionMode);
+      }
       if (message.id !== undefined) {
         this.pending.set(message.id, {
           kind: 'session',
@@ -347,7 +406,12 @@ export class GrokAcpCompatibilityProxy {
           clientIdentifier,
         });
       }
-      return { toRuntime: [message], toClient: [] };
+      return {
+        toRuntime: translated.notification
+          ? [translated.notification, translated.message]
+          : [translated.message],
+        toClient: [],
+      };
     }
     if (message.method === 'session/prompt') {
       if (message.id !== undefined) {

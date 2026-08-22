@@ -9,7 +9,9 @@ configuration options.
 
 Supported configuration:
 
-- Permission mode maps to `x.ai/yolo_mode_changed` with the current Lody
+- Initial permission mode from `_meta.lody.sessionConfig` maps to Grok's
+  startup `_meta.yoloMode` before `session/new` or restore reaches the official
+  runtime. Later changes map to `x.ai/yolo_mode_changed` with the current Lody
   `clientIdentifier`, which is registered during ACP initialization. Grok's
   native standard `session/request_permission` requests pass through unchanged.
 - Reasoning effort maps to `session/set_model`, preserving the current model and
