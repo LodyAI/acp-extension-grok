@@ -109,8 +109,6 @@ test('pins and synthesizes the official 1.0.0 private wire contract', () => {
       turnCompletedUpdate: runtimeManifest.privateWireContract.turnCompletedUpdate,
       sessionInfoRequest: runtimeManifest.privateWireContract.sessionInfoRequest,
       billingRequest: runtimeManifest.privateWireContract.billingRequest,
-      lodyUsageNotification: runtimeManifest.privateWireContract.lodyUsageNotification,
-      lodyRateLimitsNotification: runtimeManifest.privateWireContract.lodyRateLimitsNotification,
     },
     {
       sessionUpdateNotification: 'x.ai/session/update',
@@ -118,8 +116,6 @@ test('pins and synthesizes the official 1.0.0 private wire contract', () => {
       turnCompletedUpdate: 'turn_completed',
       sessionInfoRequest: 'x.ai/session/info',
       billingRequest: 'x.ai/billing',
-      lodyUsageNotification: 'acp_ext:session_usage_update',
-      lodyRateLimitsNotification: 'acp_ext:session_rate_limits',
     }
   );
   const { response } = readyProxy();
@@ -715,8 +711,11 @@ test('emits Lody token usage and requests authoritative context on turn completi
   });
 
   assert.equal(output.toClient[0].method, '_x.ai/session/update');
-  assert.equal(output.toClient[1].method, '_acp_ext:session_usage_update');
-  assert.deepEqual(output.toClient[1].params, normalizePromptUsage(promptUsage));
+  assert.equal(output.toClient[1].method, '_lody/session/usage_update');
+  assert.deepEqual(output.toClient[1].params, {
+    sessionId: 'grok-session',
+    ...normalizePromptUsage(promptUsage),
+  });
   assert.equal(output.toRuntime.length, 2);
   assert.equal(output.toRuntime[0].method, '_x.ai/session/info');
   assert.deepEqual(output.toRuntime[0].params, { sessionId: 'grok-session' });
@@ -773,47 +772,72 @@ test('converts official Grok billing into Lody session rate limits', () => {
     on_demand_enabled: true,
     subscription_tier: 'SuperGrok Heavy',
   };
-  const expected = {
-    schemaVersion: 2,
-    planName: 'SuperGrok Heavy',
-    limitName: 'Grok Build',
-    limitId: 'grok',
-    windows: [
-      {
-        usedPercent: 42.5,
-        windowDurationMins: 7 * 24 * 60,
-        resetsAt: Date.parse('2026-06-08T00:00:00Z'),
-      },
-    ],
-    fiveHour: null,
-    sevenDay: 42.5,
-    fiveHourResetAt: null,
-    sevenDayResetAt: Date.parse('2026-06-08T00:00:00Z'),
-  };
-  assert.deepEqual(normalizeBillingRateLimits(billing), expected);
+  const expectedRateLimits = [
+    {
+      planName: 'SuperGrok Heavy',
+      limitName: 'Grok Build',
+      limitId: 'grok',
+      scope: { providerId: 'grok' },
+      windows: [
+        {
+          usedPercent: 42.5,
+          windowDurationSeconds: 7 * 24 * 60 * 60,
+          resetsAtEpochSeconds: Date.parse('2026-06-08T00:00:00Z') / 1000,
+        },
+      ],
+    },
+  ];
+  const normalized = normalizeBillingRateLimits(billing);
+  assert.deepEqual(normalized.rateLimits, expectedRateLimits);
+  assert.equal(typeof normalized.fetchedAtEpochSeconds, 'number');
 
   const output = proxy.handleRuntime({
     jsonrpc: '2.0',
     id: billingRequest.id,
     result: billing,
   });
-  assert.deepEqual(output, {
-    toRuntime: [],
-    toClient: [
-      {
-        jsonrpc: '2.0',
-        method: '_acp_ext:session_rate_limits',
-        params: expected,
-      },
-    ],
+  assert.deepEqual(output.toRuntime, []);
+  assert.equal(output.toClient[0].method, '_lody/rate_limits/update');
+  assert.deepEqual(output.toClient[0].params.rateLimits, expectedRateLimits);
+});
+
+test('answers the independent Core rate-limit query without a session', () => {
+  const proxy = new GrokAcpCompatibilityProxy();
+  const request = proxy.handleClient({
+    jsonrpc: '2.0',
+    id: 91,
+    method: '_lody/rate_limits/get',
+    params: {},
   });
+  assert.equal(request.toRuntime.length, 1);
+  assert.equal(request.toRuntime[0].method, '_x.ai/billing');
+  assert.deepEqual(request.toRuntime[0].params, {});
+
+  const response = proxy.handleRuntime({
+    jsonrpc: '2.0',
+    id: request.toRuntime[0].id,
+    result: {
+      config: {
+        creditUsagePercent: 42.5,
+        currentPeriod: {
+          type: 'USAGE_PERIOD_TYPE_WEEKLY',
+          end: '2026-06-08T00:00:00Z',
+        },
+      },
+      subscription_tier: 'SuperGrok Heavy',
+    },
+  });
+  assert.deepEqual(response.toRuntime, []);
+  assert.equal(response.toClient[0].id, 91);
+  assert.equal(response.toClient[0].result.rateLimits[0].windows[0].usedPercent, 42.5);
+  assert.equal(typeof response.toClient[0].result.fetchedAtEpochSeconds, 'number');
 });
 
 test('falls back to legacy Grok billing totals and clears stale limits on billing errors', () => {
   assert.equal(
     normalizeBillingRateLimits({
       config: { monthlyLimit: { val: 2_000 }, used: { val: 500 } },
-    }).windows[0].usedPercent,
+    }).rateLimits[0].windows[0].usedPercent,
     25
   );
 
@@ -824,63 +848,42 @@ test('falls back to legacy Grok billing totals and clears stale limits on billin
     id: billingRequest.id,
     error: { code: -32603, message: 'Billing unavailable' },
   });
-  assert.deepEqual(output, {
-    toRuntime: [],
-    toClient: [
-      {
-        jsonrpc: '2.0',
-        method: '_acp_ext:session_rate_limits',
-        params: {
-          schemaVersion: 2,
-          planName: null,
-          limitName: 'Grok Build',
-          limitId: 'grok',
-          windows: [],
-          fiveHour: null,
-          sevenDay: null,
-          fiveHourResetAt: null,
-          sevenDayResetAt: null,
-          apiUnavailable: true,
-        },
-      },
-    ],
-  });
+  assert.deepEqual(output.toRuntime, []);
+  assert.equal(output.toClient[0].method, '_lody/rate_limits/update');
+  assert.deepEqual(output.toClient[0].params.rateLimits, []);
 });
 
 test('matches the official Grok TUI zero-percent fallback for fresh unified billing', () => {
-  assert.deepEqual(
-    normalizeBillingRateLimits({
-      config: {
-        currentPeriod: {
-          type: 'USAGE_PERIOD_TYPE_WEEKLY',
-          start: '2026-08-09T09:12:56Z',
-          end: '2026-08-16T09:12:56Z',
-        },
-        onDemandCap: { val: 0 },
-        onDemandUsed: { val: 0 },
-        prepaidBalance: { val: 0 },
-        isUnifiedBillingUser: true,
+  const snapshot = normalizeBillingRateLimits({
+    config: {
+      currentPeriod: {
+        type: 'USAGE_PERIOD_TYPE_WEEKLY',
+        start: '2026-08-09T09:12:56Z',
+        end: '2026-08-16T09:12:56Z',
       },
-      subscription_tier: 'X Premium+',
-    }),
+      onDemandCap: { val: 0 },
+      onDemandUsed: { val: 0 },
+      prepaidBalance: { val: 0 },
+      isUnifiedBillingUser: true,
+    },
+    subscription_tier: 'X Premium+',
+  });
+  assert.deepEqual(snapshot.rateLimits, [
     {
-      schemaVersion: 2,
       planName: 'X Premium+',
       limitName: 'Grok Build',
       limitId: 'grok',
+      scope: { providerId: 'grok' },
       windows: [
         {
           usedPercent: 0,
-          windowDurationMins: 7 * 24 * 60,
-          resetsAt: Date.parse('2026-08-16T09:12:56Z'),
+          windowDurationSeconds: 7 * 24 * 60 * 60,
+          resetsAtEpochSeconds: Date.parse('2026-08-16T09:12:56Z') / 1000,
         },
       ],
-      fiveHour: null,
-      sevenDay: 0,
-      fiveHourResetAt: null,
-      sevenDayResetAt: Date.parse('2026-08-16T09:12:56Z'),
-    }
-  );
+    },
+  ]);
+  assert.equal(typeof snapshot.fetchedAtEpochSeconds, 'number');
 });
 
 test('keeps genuinely incomplete billing visible without inventing utilization', () => {
@@ -895,8 +898,7 @@ test('keeps genuinely incomplete billing visible without inventing utilization',
     },
     subscription_tier: 'X Premium+',
   });
-  assert.equal(limits.apiUnavailable, true);
-  assert.deepEqual(limits.windows, []);
+  assert.deepEqual(limits.rateLimits, []);
 });
 
 test('does not pair historical utilization with the current billing period', () => {
@@ -918,8 +920,7 @@ test('does not pair historical utilization with the current billing period', () 
     },
     subscription_tier: 'SuperGrok',
   });
-  assert.equal(limits.apiUnavailable, true);
-  assert.deepEqual(limits.windows, []);
+  assert.deepEqual(limits.rateLimits, []);
 });
 
 test('derives utilization from official billing history totals', () => {
@@ -937,8 +938,8 @@ test('derives utilization from official billing history totals', () => {
     },
     subscription_tier: 'SuperGrok',
   });
-  assert.equal(limits.windows[0].usedPercent, 25);
-  assert.equal(limits.windows[0].windowDurationMins, 7 * 24 * 60);
+  assert.equal(limits.rateLimits[0].windows[0].usedPercent, 25);
+  assert.equal(limits.rateLimits[0].windows[0].windowDurationSeconds, 7 * 24 * 60 * 60);
 });
 
 test('uses prompt response usage as a fallback and deduplicates turn_completed', () => {
@@ -957,7 +958,7 @@ test('uses prompt response usage as a fallback and deduplicates turn_completed',
       _meta: { sessionId: 'grok-session', promptId: 'prompt-2', usage: promptUsage },
     },
   });
-  assert.equal(promptResponse.toClient[1].method, '_acp_ext:session_usage_update');
+  assert.equal(promptResponse.toClient[1].method, '_lody/session/usage_update');
   assert.equal(promptResponse.toRuntime[0].method, '_x.ai/session/info');
   assert.equal(promptResponse.toRuntime[1].method, '_x.ai/billing');
 
