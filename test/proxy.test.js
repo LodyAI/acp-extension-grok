@@ -36,6 +36,33 @@ const sessionResponse = {
   },
 };
 
+const modelSnapshot = {
+  jsonrpc: '2.0',
+  method: '_x.ai/models/update',
+  params: {
+    currentModelId: 'grok-4.6',
+    availableModels: [
+      {
+        modelId: 'grok-4.6',
+        name: 'Grok 4.6',
+        description: "SpaceXAI's latest frontier model",
+        _meta: {
+          reasoningEffort: 'high',
+          reasoningEfforts: [{ id: 'xhigh' }, { id: 'high' }, { id: 'medium' }, { id: 'low' }],
+        },
+      },
+      {
+        modelId: 'grok-4.5',
+        name: 'Grok 4.5',
+        _meta: {
+          reasoningEffort: 'high',
+          reasoningEfforts: [{ id: 'high' }, { id: 'medium' }, { id: 'low' }],
+        },
+      },
+    ],
+  },
+};
+
 function readyProxy() {
   const proxy = new GrokAcpCompatibilityProxy();
   proxy.handleClient({
@@ -78,6 +105,7 @@ test('pins and synthesizes the official 1.0.0 private wire contract', () => {
   assert.deepEqual(
     {
       sessionUpdateNotification: runtimeManifest.privateWireContract.sessionUpdateNotification,
+      modelsUpdateNotification: runtimeManifest.privateWireContract.modelsUpdateNotification,
       turnCompletedUpdate: runtimeManifest.privateWireContract.turnCompletedUpdate,
       sessionInfoRequest: runtimeManifest.privateWireContract.sessionInfoRequest,
       billingRequest: runtimeManifest.privateWireContract.billingRequest,
@@ -86,6 +114,7 @@ test('pins and synthesizes the official 1.0.0 private wire contract', () => {
     },
     {
       sessionUpdateNotification: 'x.ai/session/update',
+      modelsUpdateNotification: 'x.ai/models/update',
       turnCompletedUpdate: 'turn_completed',
       sessionInfoRequest: 'x.ai/session/info',
       billingRequest: 'x.ai/billing',
@@ -113,6 +142,141 @@ test('pins and synthesizes the official 1.0.0 private wire contract', () => {
       .find((option) => option.id === 'interaction_mode')
       .options.map((option) => option.value),
     ['agent', 'plan']
+  );
+});
+
+test('settles an initial one-model response with the late complete model snapshot', () => {
+  const proxy = new GrokAcpCompatibilityProxy({
+    deferSessionResponseUntilModelSnapshot: true,
+  });
+  proxy.handleClient({
+    jsonrpc: '2.0',
+    id: 1,
+    method: 'session/new',
+    params: {
+      cwd: '/tmp/project',
+      mcpServers: [],
+      _meta: { clientIdentifier },
+    },
+  });
+
+  const provisional = proxy.handleRuntime({
+    ...sessionResponse,
+    result: {
+      ...sessionResponse.result,
+      models: {
+        currentModelId: 'grok-4.5',
+        availableModels: [{ modelId: 'grok-4.5', name: 'Grok 4.5' }],
+      },
+    },
+  });
+  assert.deepEqual(provisional.toClient, []);
+  assert.deepEqual(provisional.deferredSessionResponseIds, [1]);
+
+  const settled = proxy.handleRuntime(modelSnapshot);
+  assert.equal(settled.toClient.length, 1);
+  assert.deepEqual(settled.settledSessionResponseIds, [1]);
+  assert.equal(settled.toClient[0].id, 1);
+  assert.deepEqual(
+    settled.toClient[0].result.models.availableModels.map((model) => model.modelId),
+    ['grok-4.6', 'grok-4.5']
+  );
+  assert.deepEqual(
+    settled.toClient[0].result.configOptions
+      .find((option) => option.id === 'model')
+      .options.map((option) => option.value),
+    ['grok-4.6', 'grok-4.5']
+  );
+  assert.deepEqual(
+    settled.toClient[0].result.configOptions
+      .find((option) => option.id === 'reasoning_effort')
+      .options.map((option) => option.value),
+    ['xhigh', 'high', 'medium', 'low']
+  );
+});
+
+test('uses a complete model snapshot that arrives before session/new returns', () => {
+  const proxy = new GrokAcpCompatibilityProxy({
+    deferSessionResponseUntilModelSnapshot: true,
+  });
+  assert.deepEqual(proxy.handleRuntime(modelSnapshot), { toRuntime: [], toClient: [] });
+  proxy.handleClient({
+    jsonrpc: '2.0',
+    id: 1,
+    method: 'session/new',
+    params: {
+      cwd: '/tmp/project',
+      mcpServers: [],
+      _meta: { clientIdentifier },
+    },
+  });
+
+  const startup = proxy.handleRuntime(sessionResponse);
+  assert.equal(startup.deferredSessionResponseIds, undefined);
+  assert.deepEqual(
+    startup.toClient[0].result.models.availableModels.map((model) => model.modelId),
+    ['grok-4.6', 'grok-4.5']
+  );
+});
+
+test('does not invent an empty models object when a session response omits models', () => {
+  const proxy = new GrokAcpCompatibilityProxy();
+  proxy.handleClient({
+    jsonrpc: '2.0',
+    id: 1,
+    method: 'session/new',
+    params: { cwd: '/tmp/project', mcpServers: [] },
+  });
+
+  const startup = proxy.handleRuntime({
+    jsonrpc: '2.0',
+    id: 1,
+    result: { sessionId: 'modeless-session' },
+  });
+  assert.equal(startup.toClient[0].result.models, undefined);
+});
+
+test('suppresses duplicate complete model snapshots', () => {
+  const { proxy } = readyProxy();
+
+  const first = proxy.handleRuntime(modelSnapshot);
+  assert.equal(first.toClient.length, 1);
+  assert.deepEqual(proxy.handleRuntime(modelSnapshot), { toRuntime: [], toClient: [] });
+});
+
+test('flushes on the bounded fallback and translates a still-later snapshot to standard ACP', () => {
+  const proxy = new GrokAcpCompatibilityProxy({
+    deferSessionResponseUntilModelSnapshot: true,
+  });
+  proxy.handleClient({
+    jsonrpc: '2.0',
+    id: 1,
+    method: 'session/new',
+    params: {
+      cwd: '/tmp/project',
+      mcpServers: [],
+      _meta: { clientIdentifier },
+    },
+  });
+  proxy.handleRuntime(sessionResponse);
+
+  const fallback = proxy.flushPendingSessionResponse(1);
+  assert.deepEqual(
+    fallback.toClient[0].result.models.availableModels.map((model) => model.modelId),
+    ['grok-build']
+  );
+
+  const updated = proxy.handleRuntime(modelSnapshot);
+  assert.equal(updated.toClient.length, 1);
+  assert.equal(updated.toClient[0].jsonrpc, '2.0');
+  assert.equal(updated.toClient[0].method, 'session/update');
+  assert.equal(updated.toClient[0].params.sessionId, 'grok-session');
+  assert.equal(updated.toClient[0].params.update.sessionUpdate, 'config_option_update');
+  assert.deepEqual(
+    updated.toClient[0].params.update.configOptions
+      .find((option) => option.id === 'model')
+      .options.map((option) => option.value),
+    ['grok-4.6', 'grok-4.5']
   );
 });
 

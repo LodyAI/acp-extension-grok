@@ -29,6 +29,8 @@ const MAX_TRACKED_PROMPTS = 256;
 const FIVE_HOUR_WINDOW_MINS = 5 * 60;
 const SEVEN_DAY_WINDOW_MINS = 7 * 24 * 60;
 
+export const GROK_MODEL_SNAPSHOT_SETTLE_TIMEOUT_MS = 2_000;
+
 function logicalExtensionMethod(method) {
   return typeof method === 'string' && method.startsWith('_') ? method.slice(1) : method;
 }
@@ -245,6 +247,31 @@ function readReasoningEfforts(model) {
     .filter((item) => typeof item === 'string');
 }
 
+function readModelSnapshot(params) {
+  if (!params || typeof params !== 'object' || !Array.isArray(params.availableModels)) {
+    return undefined;
+  }
+  if (
+    params.availableModels.length === 0 ||
+    params.availableModels.some(
+      (model) => !model || typeof model !== 'object' || typeof model.modelId !== 'string'
+    )
+  ) {
+    return undefined;
+  }
+  const currentModelId = params.currentModelId;
+  if (
+    typeof currentModelId !== 'string' ||
+    !params.availableModels.some((model) => model.modelId === currentModelId)
+  ) {
+    return undefined;
+  }
+  return {
+    currentModelId,
+    availableModels: params.availableModels,
+  };
+}
+
 function selectOption(id, name, description, currentValue, options, category) {
   return {
     id,
@@ -318,13 +345,122 @@ function translateSessionStart(message) {
 }
 
 export class GrokAcpCompatibilityProxy {
-  constructor() {
+  constructor({ deferSessionResponseUntilModelSnapshot = false } = {}) {
     this.sessions = new Map();
     this.pending = new Map();
+    this.pendingSessionResponses = new Map();
+    this.clientVisibleSessions = new Set();
+    this.latestModelSnapshot = undefined;
+    this.latestModelSnapshotFingerprint = undefined;
+    this.deferSessionResponseUntilModelSnapshot = deferSessionResponseUntilModelSnapshot;
     // Grok scopes yolo/auto mode to the Lody clientIdentifier, not to a session,
     // so the selection outlives any single session and is stored by client.
     this.permissionModes = new Map();
     this.nextInternalRequestId = Number.MAX_SAFE_INTEGER;
+  }
+
+  applyModelSnapshot(state, snapshot) {
+    const previousModelId = state.currentModelId;
+    const previousReasoningEffort = state.reasoningEffort;
+    const currentModel = snapshot.availableModels.find(
+      (model) => model.modelId === snapshot.currentModelId
+    );
+    const reasoningEfforts = readReasoningEfforts(currentModel);
+    const metadataReasoningEffort =
+      currentModel?._meta?.reasoningEffort ?? currentModel?._meta?.reasoning_effort;
+
+    state.currentModelId = snapshot.currentModelId;
+    state.models = snapshot.availableModels;
+    state.reasoningEfforts = reasoningEfforts;
+    state.reasoningEffort =
+      previousModelId === snapshot.currentModelId &&
+      reasoningEfforts.includes(previousReasoningEffort)
+        ? previousReasoningEffort
+        : typeof metadataReasoningEffort === 'string' &&
+            reasoningEfforts.includes(metadataReasoningEffort)
+          ? metadataReasoningEffort
+          : reasoningEfforts[0];
+  }
+
+  sessionResponseWithState(message, state) {
+    const models =
+      typeof state.currentModelId === 'string' && state.models.length > 0
+        ? {
+            currentModelId: state.currentModelId,
+            availableModels: state.models,
+          }
+        : message.result?.models;
+    return {
+      ...message,
+      result: {
+        ...message.result,
+        ...(models ? { models } : {}),
+        configOptions: this.configOptions(state),
+      },
+    };
+  }
+
+  exposePendingSessionResponse(id) {
+    const pending = this.pendingSessionResponses.get(id);
+    if (!pending) return { toRuntime: [], toClient: [] };
+    this.pendingSessionResponses.delete(id);
+    const state = this.sessions.get(pending.sessionId);
+    if (!state) return { toRuntime: [], toClient: [pending.message] };
+    this.clientVisibleSessions.add(pending.sessionId);
+    return {
+      toRuntime: [],
+      toClient: [this.sessionResponseWithState(pending.message, state)],
+    };
+  }
+
+  flushPendingSessionResponse(id) {
+    return this.exposePendingSessionResponse(id);
+  }
+
+  handleModelSnapshot(message) {
+    const snapshot = readModelSnapshot(message.params);
+    if (!snapshot) return { toRuntime: [], toClient: [message] };
+    const fingerprint = JSON.stringify(snapshot);
+    if (fingerprint === this.latestModelSnapshotFingerprint) {
+      return { toRuntime: [], toClient: [] };
+    }
+    this.latestModelSnapshot = snapshot;
+    this.latestModelSnapshotFingerprint = fingerprint;
+
+    for (const state of this.sessions.values()) {
+      this.applyModelSnapshot(state, snapshot);
+    }
+
+    const toClient = [];
+    const pendingSessionIds = new Set();
+    const settledSessionResponseIds = [];
+    for (const id of [...this.pendingSessionResponses.keys()]) {
+      const pending = this.pendingSessionResponses.get(id);
+      if (pending) pendingSessionIds.add(pending.sessionId);
+      toClient.push(...this.exposePendingSessionResponse(id).toClient);
+      settledSessionResponseIds.push(id);
+    }
+    for (const sessionId of this.clientVisibleSessions) {
+      if (pendingSessionIds.has(sessionId)) continue;
+      const state = this.sessions.get(sessionId);
+      if (!state) continue;
+      toClient.push({
+        jsonrpc: '2.0',
+        method: 'session/update',
+        params: {
+          sessionId,
+          update: {
+            sessionUpdate: 'config_option_update',
+            configOptions: this.configOptions(state),
+          },
+        },
+      });
+    }
+    return {
+      toRuntime: [],
+      toClient,
+      ...(settledSessionResponseIds.length > 0 ? { settledSessionResponseIds } : {}),
+    };
   }
 
   internalRequest(kind, sessionId) {
@@ -534,15 +670,30 @@ export class GrokAcpCompatibilityProxy {
       const sessionId = result.sessionId ?? pending.sessionId;
       if (!sessionId) return { toRuntime: [], toClient: [message] };
       const state = this.stateFromSessionResponse(sessionId, pending.clientIdentifier, result);
+      if (this.latestModelSnapshot) {
+        this.applyModelSnapshot(state, this.latestModelSnapshot);
+      }
       this.sessions.set(sessionId, state);
+      const sessionResponse = this.sessionResponseWithState(message, state);
+      if (
+        this.deferSessionResponseUntilModelSnapshot &&
+        !this.latestModelSnapshot &&
+        message.id !== undefined
+      ) {
+        this.pendingSessionResponses.set(message.id, {
+          message: sessionResponse,
+          sessionId,
+        });
+        return {
+          toRuntime: this.usageRefreshRequests(sessionId),
+          toClient: [],
+          deferredSessionResponseIds: [message.id],
+        };
+      }
+      this.clientVisibleSessions.add(sessionId);
       return {
         toRuntime: this.usageRefreshRequests(sessionId),
-        toClient: [
-          {
-            ...message,
-            result: { ...result, configOptions: this.configOptions(state) },
-          },
-        ],
+        toClient: [sessionResponse],
       };
     }
 
@@ -577,11 +728,14 @@ export class GrokAcpCompatibilityProxy {
 
   handleRuntimeMethod(message) {
     const passthrough = { toRuntime: [], toClient: [message] };
+    const logicalMethod = logicalExtensionMethod(message.method);
+    if (logicalMethod === contract.modelsUpdateNotification) {
+      return this.handleModelSnapshot(message);
+    }
     const sessionId = message.params?.sessionId;
     const update = message.params?.update;
     const state = this.sessions.get(sessionId);
     if (!state) return passthrough;
-    const logicalMethod = logicalExtensionMethod(message.method);
 
     if (
       logicalMethod === contract.sessionUpdateNotification &&

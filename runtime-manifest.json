@@ -9,6 +9,7 @@
     "sessionConfigMeta": "x.ai/sessionConfig",
     "sessionNotification": "x.ai/session_notification",
     "sessionUpdateNotification": "x.ai/session/update",
+    "modelsUpdateNotification": "x.ai/models/update",
     "turnCompletedUpdate": "turn_completed",
     "sessionInfoRequest": "x.ai/session/info",
     "billingRequest": "x.ai/billing",
