@@ -2,7 +2,8 @@
   "officialRuntime": {
     "package": "@xai-official/grok",
     "version": "1.0.0",
-    "minimumSupportedVersion": "1.0.0"
+    "minimumSupportedVersion": "1.0.0",
+    "compatibilityVersion": 1
   },
   "privateWireContract": {
     "permissionNotification": "x.ai/yolo_mode_changed",
