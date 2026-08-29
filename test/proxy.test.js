@@ -318,8 +318,10 @@ test('applies initial always-approve before forwarding session/new', () => {
     },
   });
 
-  assert.equal(output.toRuntime.length, 1);
-  assert.deepEqual(output.toRuntime[0].params._meta, {
+  assert.equal(output.toRuntime.length, 2);
+  assert.equal(output.toRuntime[0].method, '_x.ai/yolo_mode_changed');
+  assert.equal(output.toRuntime[0].params.yolo_mode, true);
+  assert.deepEqual(output.toRuntime[1].params._meta, {
     clientIdentifier,
     yoloMode: true,
   });
@@ -352,8 +354,11 @@ test('applies initial always-approve to restored sessions', () => {
         },
       },
     });
-    assert.equal(output.toRuntime[0].params._meta.yoloMode, true);
-    assert.equal(output.toRuntime[0].params._meta.lody, undefined);
+    assert.equal(output.toRuntime.length, 2);
+    assert.equal(output.toRuntime[0].method, '_x.ai/yolo_mode_changed');
+    const sessionMessage = output.toRuntime.at(-1);
+    assert.equal(sessionMessage.params._meta.yoloMode, true);
+    assert.equal(sessionMessage.params._meta.lody, undefined);
   }
 });
 
