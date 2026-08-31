@@ -4,7 +4,7 @@
 
 ## Model snapshot settling
 
-- Official Grok 1.0.0 may return a provisional model roster from `session/new`, then emit
+- Official Grok 1.0.13 may return a provisional model roster from `session/new`, then emit
   `_x.ai/models/update` later. The update has no session id and is a process-level complete
   snapshot containing `currentModelId` and `availableModels`.
 - The production adapter must settle a pending session response from that explicit snapshot
