@@ -15,7 +15,7 @@ const PERMISSION_MODES = {
 
 const INTERACTION_TO_RUNTIME = { agent: 'default', plan: 'plan' };
 const INTERACTION_FROM_RUNTIME = { default: 'agent', plan: 'plan', ask: 'plan' };
-// Grok 1.0.0 silently accepts `ask` without changing its runtime mode. Keep
+// Grok 1.0.13 silently accepts `ask` without changing its runtime mode. Keep
 // legacy persisted Ask selections safe by degrading them to Plan, but do not
 // advertise Ask until the runtime reports and applies it.
 const LEGACY_INTERACTION_ALIASES = { ask: 'plan' };
@@ -79,7 +79,7 @@ function billingUsagePercent(config, period) {
   );
   if (limit && used !== undefined) return (used / limit) * 100;
 
-  // Grok Build 1.0.0 omits creditUsagePercent for a fresh unified-billing
+  // Grok Build 1.0.13 omits creditUsagePercent for a fresh unified-billing
   // weekly period and reports each balance field as an explicit zero. Its own
   // `/usage` UI renders that exact response as "Weekly limit: 0%", so mirror
   // the official client only for this fully-zero, provider-authored shape.

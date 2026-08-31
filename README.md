@@ -17,7 +17,7 @@ Supported configuration:
 - Reasoning effort maps to `session/set_model`, preserving the current model and
   setting `_meta.reasoningEffort`.
 - Model and interaction mode map to the corresponding standard legacy ACP calls.
-  Grok 1.0.0 reliably supports Agent and Plan. It silently ignores Ask, so the
+  Grok 1.0.13 reliably supports Agent and Plan. It silently ignores Ask, so the
   adapter does not advertise Ask and maps legacy persisted Ask selections to
   Plan.
 - Per-turn token and trusted cost totals from Grok's prompt metadata or durable
@@ -36,7 +36,7 @@ Supported configuration:
   Billing failures never fail a session.
 
 Automatic permission mode is exposed as an experimental option. The official
-1.0.0 runtime accepts the private `auto_mode` notification but does not
+1.0.13 runtime accepts the private `auto_mode` notification but does not
 acknowledge it, so the adapter applies the selection optimistically.
 
 Run with:
