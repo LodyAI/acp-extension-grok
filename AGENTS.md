@@ -2,6 +2,19 @@
 
 `CLAUDE.md` is a symlink to this file. The public Lody repository guidelines also apply.
 
+## Per-model reasoning-effort ladders
+
+- The reasoning-effort list is the SELECTED model's ladder, re-derived from that
+  model's own `_meta.reasoningEfforts` / `_meta.reasoning_efforts` on every
+  model change; a switch to a model that publishes no ladders withdraws the
+  control rather than reusing another model's list, while a repeat for the
+  same model keeps what the session already reported.
+- Session responses publish the per-model view to Lody as
+  `_meta.lody.modelReasoningEfforts`; vendor model `_meta` never reaches Lody
+  as a contract.
+- The runtime `model_changed` notification is translated to standard ACP
+  `config_option_update`, never passed through to Lody.
+
 ## Model snapshot settling
 
 - Official Grok 1.0.13 may return a provisional model roster from `session/new`, then emit
