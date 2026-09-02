@@ -59,6 +59,7 @@ const modelSnapshot = {
           reasoningEfforts: [{ id: 'high' }, { id: 'medium' }, { id: 'low' }],
         },
       },
+      { modelId: 'kimi-k3', name: 'Kimi K3' },
     ],
   },
 };
@@ -175,13 +176,13 @@ test('settles an initial one-model response with the late complete model snapsho
   assert.equal(settled.toClient[0].id, 1);
   assert.deepEqual(
     settled.toClient[0].result.models.availableModels.map((model) => model.modelId),
-    ['grok-4.6', 'grok-4.5']
+    ['grok-4.6', 'grok-4.5', 'kimi-k3']
   );
   assert.deepEqual(
     settled.toClient[0].result.configOptions
       .find((option) => option.id === 'model')
       .options.map((option) => option.value),
-    ['grok-4.6', 'grok-4.5']
+    ['grok-4.6', 'grok-4.5', 'kimi-k3']
   );
   assert.deepEqual(
     settled.toClient[0].result.configOptions
@@ -211,7 +212,7 @@ test('uses a complete model snapshot that arrives before session/new returns', (
   assert.equal(startup.deferredSessionResponseIds, undefined);
   assert.deepEqual(
     startup.toClient[0].result.models.availableModels.map((model) => model.modelId),
-    ['grok-4.6', 'grok-4.5']
+    ['grok-4.6', 'grok-4.5', 'kimi-k3']
   );
 });
 
@@ -272,7 +273,7 @@ test('flushes on the bounded fallback and translates a still-later snapshot to s
     updated.toClient[0].params.update.configOptions
       .find((option) => option.id === 'model')
       .options.map((option) => option.value),
-    ['grok-4.6', 'grok-4.5']
+    ['grok-4.6', 'grok-4.5', 'kimi-k3']
   );
 });
 
@@ -634,6 +635,57 @@ test('preserves client-scoped permission state for a fresh replacement session',
   );
 });
 
+test('rebuilds the reasoning-effort ladder when the client switches the model', () => {
+  const { proxy } = readyProxy();
+  proxy.handleRuntime(modelSnapshot);
+  const request = proxy.handleClient({
+    jsonrpc: '2.0',
+    id: 41,
+    method: 'session/set_config_option',
+    params: { sessionId: 'grok-session', configId: 'model', value: 'grok-4.5' },
+  }).toRuntime[0];
+  assert.equal(request.method, 'session/set_model');
+  assert.equal(request.params.modelId, 'grok-4.5');
+  const response = proxy.handleRuntime({ jsonrpc: '2.0', id: 41, result: {} }).toClient[0];
+  const effort = response.result.configOptions.find((option) => option.id === 'reasoning_effort');
+  assert.deepEqual(
+    effort.options.map((option) => option.value),
+    ['high', 'medium', 'low']
+  );
+  assert.equal(effort.currentValue, 'high');
+});
+
+test('validates and translates reasoning effort against the selected model', () => {
+  const { proxy } = readyProxy();
+  proxy.handleRuntime(modelSnapshot);
+  const modelRequestId = proxy.handleClient({
+    jsonrpc: '2.0',
+    id: 41,
+    method: 'session/set_config_option',
+    params: { sessionId: 'grok-session', configId: 'model', value: 'grok-4.5' },
+  }).toRuntime[0].id;
+  proxy.handleRuntime({ jsonrpc: '2.0', id: modelRequestId, result: {} });
+
+  const rejected = proxy.handleClient({
+    jsonrpc: '2.0',
+    id: 42,
+    method: 'session/set_config_option',
+    params: { sessionId: 'grok-session', configId: 'reasoning_effort', value: 'xhigh' },
+  });
+  assert.deepEqual(rejected.toRuntime, []);
+  assert.match(rejected.toClient[0].error.message, /Unsupported Grok reasoning effort/);
+
+  const accepted = proxy.handleClient({
+    jsonrpc: '2.0',
+    id: 43,
+    method: 'session/set_config_option',
+    params: { sessionId: 'grok-session', configId: 'reasoning_effort', value: 'medium' },
+  }).toRuntime[0];
+  assert.equal(accepted.method, 'session/set_model');
+  assert.equal(accepted.params.modelId, 'grok-4.5');
+  assert.deepEqual(accepted.params._meta, { reasoningEffort: 'medium' });
+});
+
 test('tracks the official snake_case model_changed notification', () => {
   const { proxy } = readyProxy();
   const modelChanged = proxy.handleRuntime({
@@ -649,13 +701,103 @@ test('tracks the official snake_case model_changed notification', () => {
     },
   });
   assert.equal(modelChanged.toRuntime[0].method, '_x.ai/session/info');
-  const request = proxy.handleClient({
+  const update = modelChanged.toClient[0];
+  assert.equal(update.method, 'session/update');
+  assert.equal(update.params.update.sessionUpdate, 'config_option_update');
+  assert.equal(
+    update.params.update.configOptions.find((option) => option.id === 'reasoning_effort'),
+    undefined
+  );
+  const rejected = proxy.handleClient({
     jsonrpc: '2.0',
     id: 8,
     method: 'session/set_config_option',
     params: { sessionId: 'grok-session', configId: 'reasoning_effort', value: 'high' },
-  }).toRuntime[0];
-  assert.equal(request.params.modelId, 'grok-4');
+  });
+  assert.deepEqual(rejected.toRuntime, []);
+  assert.match(rejected.toClient[0].error.message, /Unsupported Grok reasoning effort/);
+});
+
+test('rebuilds the reasoning-effort ladder when the runtime changes the model', () => {
+  const { proxy } = readyProxy();
+  proxy.handleRuntime(modelSnapshot);
+  const changed = proxy.handleRuntime({
+    jsonrpc: '2.0',
+    method: 'x.ai/session_notification',
+    params: {
+      sessionId: 'grok-session',
+      update: {
+        sessionUpdate: 'model_changed',
+        model_id: 'grok-4.5',
+        reasoning_effort: 'medium',
+      },
+    },
+  });
+  assert.equal(changed.toClient[0].method, 'session/update');
+  assert.equal(changed.toClient[0].params.update.sessionUpdate, 'config_option_update');
+  assert.equal(
+    changed.toClient[0].params.update.configOptions
+      .find((option) => option.id === 'reasoning_effort')
+      .currentValue,
+    'medium'
+  );
+
+  const rejected = proxy.handleClient({
+    jsonrpc: '2.0',
+    id: 51,
+    method: 'session/set_config_option',
+    params: { sessionId: 'grok-session', configId: 'reasoning_effort', value: 'xhigh' },
+  });
+  assert.deepEqual(rejected.toRuntime, []);
+  assert.match(rejected.toClient[0].error.message, /Unsupported Grok reasoning effort/);
+});
+
+test('withdraws the reasoning-effort control when switching to a model without ladders', () => {
+  const { proxy } = readyProxy();
+  proxy.handleRuntime(modelSnapshot);
+  const modelRequestId = proxy.handleClient({
+    jsonrpc: '2.0',
+    id: 61,
+    method: 'session/set_config_option',
+    params: { sessionId: 'grok-session', configId: 'model', value: 'kimi-k3' },
+  }).toRuntime[0].id;
+  const response = proxy.handleRuntime({ jsonrpc: '2.0', id: modelRequestId, result: {} })
+    .toClient[0];
+  assert.equal(
+    response.result.configOptions.find((option) => option.id === 'reasoning_effort'),
+    undefined
+  );
+  const rejected = proxy.handleClient({
+    jsonrpc: '2.0',
+    id: 62,
+    method: 'session/set_config_option',
+    params: { sessionId: 'grok-session', configId: 'reasoning_effort', value: 'medium' },
+  });
+  assert.deepEqual(rejected.toRuntime, []);
+  assert.match(rejected.toClient[0].error.message, /Unsupported Grok reasoning effort/);
+});
+
+test('keeps the measured effort through a client switch when it stays valid', () => {
+  const { proxy } = readyProxy();
+  proxy.handleRuntime(modelSnapshot);
+  proxy.handleClient({
+    jsonrpc: '2.0',
+    id: 71,
+    method: 'session/set_config_option',
+    params: { sessionId: 'grok-session', configId: 'reasoning_effort', value: 'low' },
+  });
+  proxy.handleRuntime({ jsonrpc: '2.0', id: 71, result: {} });
+  const modelRequestId = proxy.handleClient({
+    jsonrpc: '2.0',
+    id: 72,
+    method: 'session/set_config_option',
+    params: { sessionId: 'grok-session', configId: 'model', value: 'grok-4.5' },
+  }).toRuntime[0].id;
+  const response = proxy.handleRuntime({ jsonrpc: '2.0', id: modelRequestId, result: {} })
+    .toClient[0];
+  const effort = response.result.configOptions.find((option) => option.id === 'reasoning_effort');
+  // `low` is a tier of both models: switching must not reset it to 4.5's default.
+  assert.equal(effort.currentValue, 'low');
 });
 
 test('normalizes official inclusive token counters into Lody disjoint usage buckets', () => {
