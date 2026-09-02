@@ -192,6 +192,28 @@ test('settles an initial one-model response with the late complete model snapsho
   );
 });
 
+test('publishes per-model reasoning-effort ladders on the session response meta', () => {
+  const proxy = new GrokAcpCompatibilityProxy({
+    deferSessionResponseUntilModelSnapshot: true,
+  });
+  assert.deepEqual(proxy.handleRuntime(modelSnapshot), { toRuntime: [], toClient: [] });
+  proxy.handleClient({
+    jsonrpc: '2.0',
+    id: 1,
+    method: 'session/new',
+    params: {
+      cwd: '/tmp/project',
+      mcpServers: [],
+      _meta: { clientIdentifier },
+    },
+  });
+  const settled = proxy.handleRuntime(sessionResponse).toClient[0];
+  assert.deepEqual(settled.result._meta.lody.modelReasoningEfforts, {
+    'grok-4.6': ['xhigh', 'high', 'medium', 'low'],
+    'grok-4.5': ['high', 'medium', 'low'],
+  });
+});
+
 test('uses a complete model snapshot that arrives before session/new returns', () => {
   const proxy = new GrokAcpCompatibilityProxy({
     deferSessionResponseUntilModelSnapshot: true,

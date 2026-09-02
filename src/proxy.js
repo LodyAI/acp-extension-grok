@@ -419,11 +419,27 @@ export class GrokAcpCompatibilityProxy {
             availableModels: state.models,
           }
         : message.result?.models;
+    const modelReasoningEfforts = {};
+    for (const model of state.models) {
+      const efforts = readReasoningEfforts(model);
+      if (efforts.length) modelReasoningEfforts[model.modelId] = efforts;
+    }
     return {
       ...message,
       result: {
         ...message.result,
         ...(models ? { models } : {}),
+        ...(Object.keys(modelReasoningEfforts).length > 0
+          ? {
+              _meta: {
+                ...(message.result?._meta ?? {}),
+                lody: {
+                  ...(message.result?._meta?.lody ?? {}),
+                  modelReasoningEfforts,
+                },
+              },
+            }
+          : {}),
         configOptions: this.configOptions(state),
       },
     };
