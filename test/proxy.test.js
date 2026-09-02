@@ -657,36 +657,25 @@ test('preserves client-scoped permission state for a fresh replacement session',
   );
 });
 
-test('rebuilds the reasoning-effort ladder when the client switches the model', () => {
+test('rebuilds, validates, and translates reasoning effort against the selected model', () => {
   const { proxy } = readyProxy();
   proxy.handleRuntime(modelSnapshot);
-  const request = proxy.handleClient({
+  const modelRequest = proxy.handleClient({
     jsonrpc: '2.0',
     id: 41,
     method: 'session/set_config_option',
     params: { sessionId: 'grok-session', configId: 'model', value: 'grok-4.5' },
   }).toRuntime[0];
-  assert.equal(request.method, 'session/set_model');
-  assert.equal(request.params.modelId, 'grok-4.5');
-  const response = proxy.handleRuntime({ jsonrpc: '2.0', id: 41, result: {} }).toClient[0];
+  assert.equal(modelRequest.method, 'session/set_model');
+  assert.equal(modelRequest.params.modelId, 'grok-4.5');
+  const response = proxy.handleRuntime({ jsonrpc: '2.0', id: modelRequest.id, result: {} })
+    .toClient[0];
   const effort = response.result.configOptions.find((option) => option.id === 'reasoning_effort');
   assert.deepEqual(
     effort.options.map((option) => option.value),
     ['high', 'medium', 'low']
   );
   assert.equal(effort.currentValue, 'high');
-});
-
-test('validates and translates reasoning effort against the selected model', () => {
-  const { proxy } = readyProxy();
-  proxy.handleRuntime(modelSnapshot);
-  const modelRequestId = proxy.handleClient({
-    jsonrpc: '2.0',
-    id: 41,
-    method: 'session/set_config_option',
-    params: { sessionId: 'grok-session', configId: 'model', value: 'grok-4.5' },
-  }).toRuntime[0].id;
-  proxy.handleRuntime({ jsonrpc: '2.0', id: modelRequestId, result: {} });
 
   const rejected = proxy.handleClient({
     jsonrpc: '2.0',
@@ -799,7 +788,7 @@ test('withdraws the reasoning-effort control when switching to a model without l
   assert.match(rejected.toClient[0].error.message, /Unsupported Grok reasoning effort/);
 });
 
-test('keeps the measured effort through a client switch when it stays valid', () => {
+test('keeps the measured effort across a same-model snapshot refresh', () => {
   const { proxy } = readyProxy();
   proxy.handleRuntime(modelSnapshot);
   proxy.handleClient({
@@ -809,17 +798,75 @@ test('keeps the measured effort through a client switch when it stays valid', ()
     params: { sessionId: 'grok-session', configId: 'reasoning_effort', value: 'low' },
   });
   proxy.handleRuntime({ jsonrpc: '2.0', id: 71, result: {} });
-  const modelRequestId = proxy.handleClient({
+  const refreshed = proxy.handleRuntime({
+    ...modelSnapshot,
+    params: {
+      ...modelSnapshot.params,
+      availableModels: modelSnapshot.params.availableModels.map((model, index) =>
+        index === 0 ? { ...model, name: `${model.name} refreshed` } : model
+      ),
+    },
+  }).toClient[0];
+  assert.equal(
+    refreshed.params.update.configOptions.find((option) => option.id === 'reasoning_effort')
+      .currentValue,
+    'low'
+  );
+});
+
+test('settles a model switch on the target model published default', () => {
+  const { proxy } = readyProxy();
+  proxy.handleRuntime(modelSnapshot);
+  const firstSwitch = proxy.handleClient({
     jsonrpc: '2.0',
-    id: 72,
+    id: 81,
     method: 'session/set_config_option',
     params: { sessionId: 'grok-session', configId: 'model', value: 'grok-4.5' },
-  }).toRuntime[0].id;
-  const response = proxy.handleRuntime({ jsonrpc: '2.0', id: modelRequestId, result: {} })
+  }).toRuntime[0];
+  proxy.handleRuntime({ jsonrpc: '2.0', id: firstSwitch.id, result: {} });
+  proxy.handleClient({
+    jsonrpc: '2.0',
+    id: 82,
+    method: 'session/set_config_option',
+    params: { sessionId: 'grok-session', configId: 'reasoning_effort', value: 'low' },
+  });
+  proxy.handleRuntime({ jsonrpc: '2.0', id: 82, result: {} });
+  const secondSwitch = proxy.handleClient({
+    jsonrpc: '2.0',
+    id: 83,
+    method: 'session/set_config_option',
+    params: { sessionId: 'grok-session', configId: 'model', value: 'grok-4.6' },
+  }).toRuntime[0];
+  const response = proxy.handleRuntime({ jsonrpc: '2.0', id: secondSwitch.id, result: {} })
     .toClient[0];
   const effort = response.result.configOptions.find((option) => option.id === 'reasoning_effort');
-  // `low` is a tier of both models: switching must not reset it to 4.5's default.
-  assert.equal(effort.currentValue, 'low');
+  // A bare model switch follows the runtime's own semantics: the target
+  // model's published default wins — not the previous model's effort, and
+  // not the first ladder entry.
+  assert.equal(effort.currentValue, 'high');
+});
+
+test('keeps the reported ladder through a same-model snapshot without metadata', () => {
+  const { proxy } = readyProxy();
+  const refreshed = proxy.handleRuntime({
+    ...modelSnapshot,
+    params: {
+      currentModelId: 'grok-build',
+      availableModels: [
+        { modelId: 'grok-build', name: 'Grok Build' },
+        { modelId: 'kimi-k3', name: 'Kimi K3' },
+      ],
+    },
+  }).toClient[0];
+  const effort = refreshed.params.update.configOptions.find(
+    (option) => option.id === 'reasoning_effort'
+  );
+  // The session reported this model's own ladder at startup; a roster
+  // refresh that keeps the same current model must not withdraw it.
+  assert.deepEqual(
+    effort.options.map((option) => option.value),
+    ['low', 'high']
+  );
 });
 
 test('normalizes official inclusive token counters into Lody disjoint usage buckets', () => {

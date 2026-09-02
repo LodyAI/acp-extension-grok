@@ -398,12 +398,12 @@ export class GrokAcpCompatibilityProxy {
       typeof reportedReasoningEffort === 'string' &&
         reasoningEfforts.includes(reportedReasoningEffort)
         ? reportedReasoningEffort
-        : reasoningEfforts.includes(state.reasoningEffort)
+        : previousModelId === currentModelId && reasoningEfforts.includes(state.reasoningEffort)
           ? state.reasoningEffort
           : typeof metadataReasoningEffort === 'string' &&
-              reasoningEfforts.includes(metadataReasoningEffort)
-            ? metadataReasoningEffort
-            : reasoningEfforts[0];
+                reasoningEfforts.includes(metadataReasoningEffort)
+              ? metadataReasoningEffort
+              : reasoningEfforts[0];
   }
 
   applyModelSnapshot(state, snapshot) {
@@ -434,7 +434,6 @@ export class GrokAcpCompatibilityProxy {
               _meta: {
                 ...(message.result?._meta ?? {}),
                 lody: {
-                  ...(message.result?._meta?.lody ?? {}),
                   modelReasoningEfforts,
                 },
               },
@@ -854,8 +853,6 @@ export class GrokAcpCompatibilityProxy {
       const reasoningEffort = update.reasoning_effort ?? update.reasoningEffort;
       if (typeof modelId === 'string') {
         this.applyCurrentModel(state, modelId, reasoningEffort);
-      } else if (typeof reasoningEffort === 'string') {
-        state.reasoningEffort = reasoningEffort;
       }
       // The vendor notification is not standard ACP and Lody ignores it, so
       // the state change reaches the client as a standard config update.
