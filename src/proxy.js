@@ -375,27 +375,40 @@ export class GrokAcpCompatibilityProxy {
     this.nextInternalRequestId = Number.MAX_SAFE_INTEGER;
   }
 
-  applyModelSnapshot(state, snapshot) {
+  applyCurrentModel(state, currentModelId, reportedReasoningEffort) {
     const previousModelId = state.currentModelId;
-    const previousReasoningEffort = state.reasoningEffort;
-    const currentModel = snapshot.availableModels.find(
-      (model) => model.modelId === snapshot.currentModelId
-    );
+    const currentModel = state.models.find((model) => model.modelId === currentModelId);
     const reasoningEfforts = readReasoningEfforts(currentModel);
     const metadataReasoningEffort =
       currentModel?._meta?.reasoningEffort ?? currentModel?._meta?.reasoning_effort;
-
-    state.currentModelId = snapshot.currentModelId;
-    state.models = snapshot.availableModels;
+    state.currentModelId = currentModelId;
+    if (reasoningEfforts.length === 0) {
+      // A model switch to a model that publishes no ladders withdraws the
+      // control: the previous model's list must not masquerade as validated
+      // values for the new one. A repeat for the same model keeps whatever
+      // the session already reported.
+      if (previousModelId !== currentModelId) state.reasoningEfforts = [];
+      if (typeof reportedReasoningEffort === 'string') {
+        state.reasoningEffort = reportedReasoningEffort;
+      }
+      return;
+    }
     state.reasoningEfforts = reasoningEfforts;
     state.reasoningEffort =
-      previousModelId === snapshot.currentModelId &&
-      reasoningEfforts.includes(previousReasoningEffort)
-        ? previousReasoningEffort
-        : typeof metadataReasoningEffort === 'string' &&
-            reasoningEfforts.includes(metadataReasoningEffort)
-          ? metadataReasoningEffort
-          : reasoningEfforts[0];
+      typeof reportedReasoningEffort === 'string' &&
+        reasoningEfforts.includes(reportedReasoningEffort)
+        ? reportedReasoningEffort
+        : previousModelId === currentModelId && reasoningEfforts.includes(state.reasoningEffort)
+          ? state.reasoningEffort
+          : typeof metadataReasoningEffort === 'string' &&
+                reasoningEfforts.includes(metadataReasoningEffort)
+              ? metadataReasoningEffort
+              : reasoningEfforts[0];
+  }
+
+  applyModelSnapshot(state, snapshot) {
+    state.models = snapshot.availableModels;
+    this.applyCurrentModel(state, snapshot.currentModelId);
   }
 
   sessionResponseWithState(message, state) {
@@ -406,11 +419,26 @@ export class GrokAcpCompatibilityProxy {
             availableModels: state.models,
           }
         : message.result?.models;
+    const modelReasoningEfforts = {};
+    for (const model of state.models) {
+      const efforts = readReasoningEfforts(model);
+      if (efforts.length) modelReasoningEfforts[model.modelId] = efforts;
+    }
     return {
       ...message,
       result: {
         ...message.result,
         ...(models ? { models } : {}),
+        ...(Object.keys(modelReasoningEfforts).length > 0
+          ? {
+              _meta: {
+                ...(message.result?._meta ?? {}),
+                lody: {
+                  modelReasoningEfforts,
+                },
+              },
+            }
+          : {}),
         configOptions: this.configOptions(state),
       },
     };
@@ -772,7 +800,7 @@ export class GrokAcpCompatibilityProxy {
 
     const state = this.sessions.get(pending.sessionId);
     if (!state) return { toRuntime: [], toClient: [message] };
-    if (pending.configId === 'model') state.currentModelId = pending.value;
+    if (pending.configId === 'model') this.applyCurrentModel(state, pending.value);
     if (pending.configId === 'reasoning_effort') state.reasoningEffort = pending.value;
     if (pending.configId === 'interaction_mode') state.interactionMode = pending.value;
     return {
@@ -823,11 +851,26 @@ export class GrokAcpCompatibilityProxy {
     ) {
       const modelId = update.model_id ?? update.modelId;
       const reasoningEffort = update.reasoning_effort ?? update.reasoningEffort;
-      if (typeof modelId === 'string') state.currentModelId = modelId;
-      if (typeof reasoningEffort === 'string') state.reasoningEffort = reasoningEffort;
+      if (typeof modelId === 'string') {
+        this.applyCurrentModel(state, modelId, reasoningEffort);
+      }
+      // The vendor notification is not standard ACP and Lody ignores it, so
+      // the state change reaches the client as a standard config update.
       return {
         toRuntime: [this.internalRequest('context', sessionId)],
-        toClient: [message],
+        toClient: [
+          {
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId,
+              update: {
+                sessionUpdate: 'config_option_update',
+                configOptions: this.configOptions(state),
+              },
+            },
+          },
+        ],
       };
     }
 
