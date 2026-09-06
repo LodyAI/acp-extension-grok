@@ -354,7 +354,7 @@ function translateSessionStart(message) {
     message: translated,
     permissionMode,
     notification:
-      mapped.auto_mode && typeof clientIdentifier === 'string'
+      typeof clientIdentifier === 'string' && (mapped.auto_mode || mapped.yolo_mode)
         ? permissionNotification(clientIdentifier, permissionMode)
         : undefined,
   };
