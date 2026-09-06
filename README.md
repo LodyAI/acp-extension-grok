@@ -10,10 +10,14 @@ configuration options.
 Supported configuration:
 
 - Initial permission mode from `_meta.lody.sessionConfig` maps to Grok's
-  startup `_meta.yoloMode` before `session/new` or restore reaches the official
+  startup `_meta.yoloMode` and `_meta.autoMode` (both explicit, including false)
+  before `session/new` or restore reaches the official
   runtime. Later changes map to `x.ai/yolo_mode_changed` with the current Lody
   `clientIdentifier`, which is registered during ACP initialization. Grok's
   native standard `session/request_permission` requests pass through unchanged.
+  Like the official TUI, Lody answers tool permissions with `allow_once` while
+  Always Approve is selected and drains waiting requests when it is enabled.
+  Keeping that handling in Lody also resolves its durable history and waiting UI.
 - Reasoning effort maps to `session/set_model`, preserving the current model and
   setting `_meta.reasoningEffort`.
 - Model and interaction mode map to the corresponding standard legacy ACP calls.

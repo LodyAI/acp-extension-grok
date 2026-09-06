@@ -337,9 +337,8 @@ function translateSessionStart(message) {
   const params = message.params ?? {};
   const permissionMode = readLodySessionConfigOption(params._meta, 'permission_mode');
   const mapped = typeof permissionMode === 'string' ? PERMISSION_MODES[permissionMode] : undefined;
-  if (!mapped) return { message, permissionMode: undefined, notification: undefined };
+  if (!mapped) return { message, permissionMode: undefined };
 
-  const clientIdentifier = params._meta?.clientIdentifier;
   const translated = {
     ...message,
     params: {
@@ -347,16 +346,13 @@ function translateSessionStart(message) {
       _meta: {
         ...stripLodySessionConfig(params._meta),
         yoloMode: mapped.yolo_mode,
+        autoMode: mapped.auto_mode,
       },
     },
   };
   return {
     message: translated,
     permissionMode,
-    notification:
-      typeof clientIdentifier === 'string' && (mapped.auto_mode || mapped.yolo_mode)
-        ? permissionNotification(clientIdentifier, permissionMode)
-        : undefined,
   };
 }
 
@@ -570,9 +566,7 @@ export class GrokAcpCompatibilityProxy {
         });
       }
       return {
-        toRuntime: translated.notification
-          ? [translated.notification, translated.message]
-          : [translated.message],
+        toRuntime: [translated.message],
         toClient: [],
       };
     }
