@@ -15,6 +15,15 @@
 - The runtime `model_changed` notification is translated to standard ACP
   `config_option_update`, never passed through to Lody.
 
+## Permission modes
+
+- Seed both `yoloMode` and `autoMode`, including explicit false, on new/load/resume/fork.
+  Pre-session notifications cannot configure a session that does not exist yet.
+- Live selections still use the client-scoped `x.ai/yolo_mode_changed` notification.
+  Forward native permissions unchanged: Lody owns the durable request and mirrors the
+  official TUI's `AllowOnce` response and pending queue drain for Always Approve.
+  Do not consume a pending request inside the adapter and leave Lody's UI waiting.
+
 ## Model snapshot settling
 
 - Official Grok 1.0.13 may return a provisional model roster from `session/new`, then emit

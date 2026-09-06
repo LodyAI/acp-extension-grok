@@ -341,12 +341,11 @@ test('applies initial always-approve before forwarding session/new', () => {
     },
   });
 
-  assert.equal(output.toRuntime.length, 2);
-  assert.equal(output.toRuntime[0].method, '_x.ai/yolo_mode_changed');
-  assert.equal(output.toRuntime[0].params.yolo_mode, true);
-  assert.deepEqual(output.toRuntime[1].params._meta, {
+  assert.equal(output.toRuntime.length, 1);
+  assert.deepEqual(output.toRuntime[0].params._meta, {
     clientIdentifier,
     yoloMode: true,
+    autoMode: false,
   });
   const response = proxy.handleRuntime(sessionResponse).toClient[0];
   assert.equal(
@@ -356,7 +355,7 @@ test('applies initial always-approve before forwarding session/new', () => {
 });
 
 test('applies initial always-approve to restored sessions', () => {
-  for (const method of ['session/load', 'session/resume']) {
+  for (const method of ['session/load', 'session/resume', 'session/fork']) {
     const proxy = new GrokAcpCompatibilityProxy();
     const output = proxy.handleClient({
       jsonrpc: '2.0',
@@ -377,18 +376,17 @@ test('applies initial always-approve to restored sessions', () => {
         },
       },
     });
-    assert.equal(output.toRuntime.length, 2);
-    assert.equal(output.toRuntime[0].method, '_x.ai/yolo_mode_changed');
-    const sessionMessage = output.toRuntime.at(-1);
-    assert.equal(sessionMessage.params._meta.yoloMode, true);
-    assert.equal(sessionMessage.params._meta.lody, undefined);
+    assert.equal(output.toRuntime.length, 1);
+    assert.equal(output.toRuntime[0].params._meta.yoloMode, true);
+    assert.equal(output.toRuntime[0].params._meta.autoMode, false);
+    assert.equal(output.toRuntime[0].params._meta.lody, undefined);
   }
 });
 
 test('maps initial ask and auto permission modes at the session boundary', () => {
-  for (const [permissionMode, expectedYoloMode, expectedRuntimeMessages] of [
-    ['ask', false, 1],
-    ['auto', false, 2],
+  for (const [permissionMode, expectedAutoMode] of [
+    ['ask', false],
+    ['auto', true],
   ]) {
     const proxy = new GrokAcpCompatibilityProxy();
     const output = proxy.handleClient({
@@ -409,12 +407,9 @@ test('maps initial ask and auto permission modes at the session boundary', () =>
         },
       },
     });
-    assert.equal(output.toRuntime.length, expectedRuntimeMessages);
-    assert.equal(output.toRuntime.at(-1).params._meta.yoloMode, expectedYoloMode);
-    if (permissionMode === 'auto') {
-      assert.equal(output.toRuntime[0].method, '_x.ai/yolo_mode_changed');
-      assert.equal(output.toRuntime[0].params.auto_mode, true);
-    }
+    assert.equal(output.toRuntime.length, 1);
+    assert.equal(output.toRuntime[0].params._meta.yoloMode, false);
+    assert.equal(output.toRuntime[0].params._meta.autoMode, expectedAutoMode);
     const response = proxy.handleRuntime(sessionResponse).toClient[0];
     assert.equal(
       response.result.configOptions.find((option) => option.id === 'permission_mode').currentValue,
