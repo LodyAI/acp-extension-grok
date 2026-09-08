@@ -1227,3 +1227,207 @@ test('Plan boolean switches preserve Always Approve and reject strings', () => {
   }
   assert.ok(select(104, 'plan_mode', 'true').toClient[0].error);
 });
+
+function planReviewProxy(capabilities = { plan: {}, elicitation: { form: {} } }) {
+  const { proxy } = readyProxy();
+  proxy.handleClient({
+    jsonrpc: '2.0',
+    id: 'init-plan',
+    method: 'initialize',
+    params: { clientCapabilities: capabilities },
+  });
+  return proxy;
+}
+function planRequest(id = 17, wrapped = false, planContent = '# Plan\nTest the behavior') {
+  const params = { sessionId: 'grok-session', toolCallId: `plan-${id}`, planContent };
+  return {
+    jsonrpc: '2.0',
+    id,
+    method: '_x.ai/exit_plan_mode',
+    params: wrapped ? { method: 'x.ai/exit_plan_mode', params } : params,
+  };
+}
+function planAnswer(proxy, optionId, id = 17) {
+  return proxy.handleClient({
+    jsonrpc: '2.0',
+    id,
+    result: { outcome: { outcome: 'selected', optionId } },
+  });
+}
+
+test('publishes a standard plan and explicit decision without changing Always Approve', () => {
+  const proxy = planReviewProxy();
+  proxy.handleClient({
+    jsonrpc: '2.0',
+    id: 'permission',
+    method: 'session/set_config_option',
+    params: { sessionId: 'grok-session', configId: 'permission_mode', value: 'always-approve' },
+  });
+  const output = proxy.handleRuntime(planRequest());
+  assert.equal(output.toRuntime.length, 0);
+  assert.deepEqual(output.toClient[0].params.update, {
+    sessionUpdate: 'plan_update',
+    plan: { type: 'markdown', planId: 'plan-17', content: '# Plan\nTest the behavior' },
+  });
+  const request = output.toClient.at(-1);
+  assert.equal(request.method, 'session/request_permission');
+  assert.equal(request.params.toolCall.kind, 'switch_mode');
+  assert.equal(request.params.toolCall.rawInput.plan, '# Plan\nTest the behavior');
+  assert.deepEqual(request.params.toolCall.content, []);
+  assert.deepEqual(
+    request.params.options.map((o) => o.optionId),
+    ['approve', 'revise', 'abandon']
+  );
+  assert.deepEqual(planAnswer(proxy, 'approve').toRuntime, [
+    { jsonrpc: '2.0', id: 17, result: { outcome: 'approved' } },
+  ]);
+  assert.equal(
+    proxy.configOptions(proxy.sessions.get('grok-session')).find((o) => o.id === 'permission_mode')
+      .currentValue,
+    'always-approve'
+  );
+  assert.equal(proxy.planReviews.pending.size, 0);
+});
+
+test('uses Core form metadata for revision feedback and restores the native response envelope', () => {
+  const proxy = planReviewProxy();
+  proxy.handleRuntime(planRequest(17, true));
+  const revise = planAnswer(proxy, 'revise');
+  assert.deepEqual(revise.toRuntime, []);
+  const form = revise.toClient[0];
+  assert.equal(form.method, 'elicitation/create');
+  assert.equal(form.params.toolCallId, 'plan-17:feedback');
+  assert.deepEqual(form.params._meta, { lody: { elicitation: { version: 1 } } });
+  assert.equal(form.params.requestedSchema.properties.feedback.type, 'string');
+  const reply = proxy.handleClient({
+    jsonrpc: '2.0',
+    id: form.id,
+    result: { action: 'accept', content: { feedback: 'Cover recovery too' } },
+  });
+  assert.deepEqual(reply.toRuntime[0], {
+    jsonrpc: '2.0',
+    id: 17,
+    result: { result: { outcome: 'cancelled', feedback: 'Cover recovery too' } },
+  });
+  assert.equal(reply.toClient.length, 2);
+  assert.equal(proxy.planReviews.pending.size, 0);
+});
+
+test('supports clients without plan updates or form elicitation', () => {
+  const proxy = planReviewProxy({});
+  const output = proxy.handleRuntime(planRequest());
+  assert.equal(output.toClient[0].params.update.sessionUpdate, 'tool_call');
+  assert.equal(
+    output.toClient.at(-1).params.toolCall.content[0].content.text,
+    '# Plan\nTest the behavior'
+  );
+  assert.deepEqual(planAnswer(proxy, 'revise').toRuntime[0].result, { outcome: 'cancelled' });
+});
+
+test('empty plans still have an approval surface', () => {
+  const proxy = planReviewProxy({});
+  const output = proxy.handleRuntime(planRequest(17, false, null));
+  assert.equal(
+    output.toClient.at(-1).params.toolCall.content[0].content.text,
+    'No plan written yet.'
+  );
+  assert.deepEqual(planAnswer(proxy, 'abandon').toRuntime[0].result, { outcome: 'abandoned' });
+});
+
+test('errors, dismissals, and unknown decisions never approve a plan', () => {
+  for (const response of [
+    { error: { code: -1, message: 'Disconnected' } },
+    { result: {} },
+    { result: { outcome: { outcome: 'cancelled' } } },
+    { result: { outcome: { outcome: 'selected', optionId: 'unknown' } } },
+  ]) {
+    const proxy = planReviewProxy();
+    proxy.handleRuntime(planRequest());
+    assert.deepEqual(
+      proxy.handleClient({ jsonrpc: '2.0', id: 17, ...response }).toRuntime[0].result,
+      { outcome: 'cancelled' }
+    );
+  }
+});
+
+test('declining revision feedback keeps planning without fabricating feedback', () => {
+  const proxy = planReviewProxy();
+  proxy.handleRuntime(planRequest());
+  planAnswer(proxy, 'revise');
+  assert.deepEqual(
+    proxy.handleClient({ jsonrpc: '2.0', id: 17, result: { action: 'decline' } }).toRuntime[0]
+      .result,
+    { outcome: 'cancelled' }
+  );
+});
+
+test('session cancellation resolves pending plan decisions and keeps other sessions intact', () => {
+  const proxy = planReviewProxy();
+  proxy.sessions.set('other', { ...proxy.sessions.get('grok-session'), sessionId: 'other' });
+  proxy.handleRuntime(planRequest());
+  planAnswer(proxy, 'revise');
+  const other = planRequest(18);
+  other.params.sessionId = 'other';
+  proxy.handleRuntime(other);
+  const cancel = {
+    jsonrpc: '2.0',
+    method: 'session/cancel',
+    params: { sessionId: 'grok-session' },
+  };
+  const result = proxy.handleClient(cancel);
+  assert.deepEqual(result.toRuntime, [
+    { jsonrpc: '2.0', id: 17, result: { outcome: 'cancelled' } },
+    cancel,
+  ]);
+  assert.deepEqual(planAnswer(proxy, 'approve', 18).toRuntime[0].result, { outcome: 'approved' });
+  assert.equal(proxy.planReviews.pending.size, 0);
+});
+
+test('reverse plan request ids do not consume client requests or native responses with the same id', () => {
+  const proxy = planReviewProxy();
+  proxy.handleRuntime(planRequest(1));
+  const prompt = {
+    jsonrpc: '2.0',
+    id: 1,
+    method: 'session/prompt',
+    params: { sessionId: 'grok-session', prompt: [] },
+  };
+  assert.equal(proxy.handleClient(prompt).toRuntime[0].method, 'session/prompt');
+  proxy.handleRuntime({ jsonrpc: '2.0', id: 1, result: { stopReason: 'end_turn' } });
+  assert.deepEqual(planAnswer(proxy, 'approve', 1).toRuntime[0].result, { outcome: 'approved' });
+});
+
+test('rejects malformed or detached plan requests without opening a UI', () => {
+  for (const patch of [{ sessionId: 'unknown' }, { toolCallId: '' }, { planContent: {} }]) {
+    const proxy = planReviewProxy();
+    const request = planRequest();
+    Object.assign(request.params, patch);
+    const result = proxy.handleRuntime(request);
+    assert.equal(result.toRuntime[0].error.code, -32602);
+    assert.deepEqual(result.toClient, []);
+  }
+});
+
+test('native enter/exit mode updates refresh the Core toggle without changing permission', () => {
+  const proxy = planReviewProxy();
+  for (const [currentModeId, enabled] of [
+    ['plan', true],
+    ['default', false],
+  ]) {
+    const message = {
+      jsonrpc: '2.0',
+      method: 'session/update',
+      params: {
+        sessionId: 'grok-session',
+        update: { sessionUpdate: 'current_mode_update', currentModeId },
+      },
+    };
+    const output = proxy.handleRuntime(message);
+    assert.deepEqual(output.toClient[0], message);
+    assert.equal(output.toClient[1].params.update.sessionUpdate, 'config_option_update');
+    assert.equal(
+      output.toClient[1].params.update.configOptions.find((o) => o.id === 'plan_mode').currentValue,
+      enabled
+    );
+  }
+});

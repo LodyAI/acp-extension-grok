@@ -1,5 +1,10 @@
+import { GrokPlanReviewBridge } from './plan-review.js';
 import runtimeManifest from '../runtime-manifest.json' with { type: 'json' };
-import { LODY_EXTENSION_METHODS, LODY_PLAN_MODE_CONFIG_ID, createPlanModeConfigOption } from 'acp-extension-core';
+import {
+  LODY_EXTENSION_METHODS,
+  LODY_PLAN_MODE_CONFIG_ID,
+  createPlanModeConfigOption,
+} from 'acp-extension-core';
 
 const contract = runtimeManifest.privateWireContract;
 
@@ -359,6 +364,8 @@ function translateSessionStart(message) {
 export class GrokAcpCompatibilityProxy {
   constructor({ deferSessionResponseUntilModelSnapshot = false } = {}) {
     this.sessions = new Map();
+    this.planReviews = new GrokPlanReviewBridge();
+    this.clientCapabilities = {};
     this.pending = new Map();
     this.pendingSessionResponses = new Map();
     this.clientVisibleSessions = new Set();
@@ -535,8 +542,15 @@ export class GrokAcpCompatibilityProxy {
 
   handleClient(message) {
     if (!message || typeof message !== 'object') return { toRuntime: [message], toClient: [] };
+    const planResponse = this.planReviews.response(message);
+    if (planResponse) return planResponse;
     const params = message.params ?? {};
+    if (message.method === 'session/cancel') {
+      const cancelled = this.planReviews.cancel(params.sessionId);
+      return { toRuntime: [...cancelled.toRuntime, message], toClient: cancelled.toClient };
+    }
     if (message.method === 'initialize' && message.id !== undefined) {
+      this.clientCapabilities = params.clientCapabilities ?? {};
       this.pending.set(message.id, { kind: 'initialize' });
       return { toRuntime: [message], toClient: [] };
     }
@@ -585,7 +599,12 @@ export class GrokAcpCompatibilityProxy {
 
     const { sessionId, configId, value } = params;
     const state = this.sessions.get(sessionId);
-    if (!state || (configId === LODY_PLAN_MODE_CONFIG_ID ? typeof value !== 'boolean' : typeof value !== 'string')) {
+    if (
+      !state ||
+      (configId === LODY_PLAN_MODE_CONFIG_ID
+        ? typeof value !== 'boolean'
+        : typeof value !== 'string')
+    ) {
       return {
         toRuntime: [],
         toClient: [errorResponse(message.id, 'Unknown Grok session or invalid config value')],
@@ -658,9 +677,12 @@ export class GrokAcpCompatibilityProxy {
         params: { sessionId, modelId: value },
       };
     } else if (configId === LODY_PLAN_MODE_CONFIG_ID || configId === 'interaction_mode') {
-      effectiveValue = configId === LODY_PLAN_MODE_CONFIG_ID
-        ? (value ? 'plan' : 'agent')
-        : (LEGACY_INTERACTION_ALIASES[value] ?? value);
+      effectiveValue =
+        configId === LODY_PLAN_MODE_CONFIG_ID
+          ? value
+            ? 'plan'
+            : 'agent'
+          : (LEGACY_INTERACTION_ALIASES[value] ?? value);
       const modeId = INTERACTION_TO_RUNTIME[effectiveValue];
       if (!modeId) return unsupportedConfigOption(message.id, configId);
       translated = {
@@ -798,7 +820,8 @@ export class GrokAcpCompatibilityProxy {
     if (!state) return { toRuntime: [], toClient: [message] };
     if (pending.configId === 'model') this.applyCurrentModel(state, pending.value);
     if (pending.configId === 'reasoning_effort') state.reasoningEffort = pending.value;
-    if (pending.configId === LODY_PLAN_MODE_CONFIG_ID || pending.configId === 'interaction_mode') state.interactionMode = pending.value;
+    if (pending.configId === LODY_PLAN_MODE_CONFIG_ID || pending.configId === 'interaction_mode')
+      state.interactionMode = pending.value;
     return {
       toRuntime: [],
       toClient: [
@@ -814,6 +837,9 @@ export class GrokAcpCompatibilityProxy {
   handleRuntimeMethod(message) {
     const passthrough = { toRuntime: [], toClient: [message] };
     const logicalMethod = logicalExtensionMethod(message.method);
+    if (logicalMethod === contract.planApprovalRequest) {
+      return this.planReviews.start(message, this.sessions, this.clientCapabilities);
+    }
     if (logicalMethod === contract.modelsUpdateNotification) {
       return this.handleModelSnapshot(message);
     }
@@ -837,8 +863,25 @@ export class GrokAcpCompatibilityProxy {
 
     if (message.method === 'session/update' && update?.sessionUpdate === 'current_mode_update') {
       const interactionMode = INTERACTION_FROM_RUNTIME[update.currentModeId];
-      if (interactionMode) state.interactionMode = interactionMode;
-      return passthrough;
+      if (!interactionMode) return passthrough;
+      state.interactionMode = interactionMode;
+      return {
+        toRuntime: [],
+        toClient: [
+          message,
+          {
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId,
+              update: {
+                sessionUpdate: 'config_option_update',
+                configOptions: this.configOptions(state),
+              },
+            },
+          },
+        ],
+      };
     }
 
     if (

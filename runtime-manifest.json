@@ -15,6 +15,7 @@
     "billingRequest": "x.ai/billing",
     "weeklyUsagePeriodType": "USAGE_PERIOD_TYPE_WEEKLY",
     "reasoningEffortMeta": "reasoningEffort",
-    "autoPermissionMode": true
+    "autoPermissionMode": true,
+    "planApprovalRequest": "x.ai/exit_plan_mode"
   }
 }
