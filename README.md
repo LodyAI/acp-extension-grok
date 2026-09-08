@@ -48,3 +48,7 @@ Run with:
 ```sh
 GROK_PATH=/path/to/official/grok node src/index.js
 ```
+
+## Plan configuration
+
+Core’s boolean `plan_mode` option replaces the interaction-mode picker. The adapter maps it to the native default/plan session mode independently of `permission_mode`.

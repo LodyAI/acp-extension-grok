@@ -122,7 +122,7 @@ test('pins and synthesizes the official 1.0.13 private wire contract', () => {
   const { response } = readyProxy();
   assert.deepEqual(
     response.result.configOptions.map((option) => option.id),
-    ['interaction_mode', 'permission_mode', 'model', 'reasoning_effort']
+    ['plan_mode', 'permission_mode', 'model', 'reasoning_effort']
   );
   assert.equal(
     response.result.configOptions.find((option) => option.id === 'reasoning_effort').currentValue,
@@ -135,10 +135,8 @@ test('pins and synthesizes the official 1.0.13 private wire contract', () => {
     ['ask', 'auto', 'always-approve']
   );
   assert.deepEqual(
-    response.result.configOptions
-      .find((option) => option.id === 'interaction_mode')
-      .options.map((option) => option.value),
-    ['agent', 'plan']
+    response.result.configOptions.find((option) => option.id === 'plan_mode')?.type,
+    'boolean'
   );
 });
 
@@ -515,9 +513,9 @@ test('safely degrades a legacy Ask interaction selection to Plan across response
   });
   const modeResponse = proxy.handleRuntime({ jsonrpc: '2.0', id: 31, result: {} }).toClient[0];
   assert.equal(
-    modeResponse.result.configOptions.find((option) => option.id === 'interaction_mode')
+    modeResponse.result.configOptions.find((option) => option.id === 'plan_mode')
       .currentValue,
-    'plan'
+    true
   );
   const response = proxy.handleClient({
     jsonrpc: '2.0',
@@ -531,9 +529,9 @@ test('safely degrades a legacy Ask interaction selection to Plan across response
     result: {},
   }).toClient[0];
   assert.equal(
-    configResponse.result.configOptions.find((option) => option.id === 'interaction_mode')
+    configResponse.result.configOptions.find((option) => option.id === 'plan_mode')
       .currentValue,
-    'plan'
+    true
   );
   assert.equal(response.toRuntime[0].method, 'session/set_model');
 });
@@ -1208,4 +1206,24 @@ test('does not record or re-query historical usage from replayed completions', (
   });
   assert.equal(replay.toClient.length, 1);
   assert.equal(replay.toRuntime.length, 0);
+});
+
+
+test('Plan boolean switches preserve Always Approve and reject strings', () => {
+  const { proxy } = readyProxy();
+  const select = (id, configId, value) => proxy.handleClient({
+    jsonrpc: '2.0', id, method: 'session/set_config_option',
+    params: { sessionId: 'grok-session', configId, value },
+  });
+  select(101, 'permission_mode', 'always-approve');
+  for (const [id, value] of [[102, true], [103, false]]) {
+    const request = select(id, 'plan_mode', value).toRuntime[0];
+    assert.equal(request.method, 'session/set_mode');
+    assert.equal(request.params.modeId, value ? 'plan' : 'default');
+    const reply = proxy.handleRuntime({ jsonrpc: '2.0', id, result: {} }).toClient[0];
+    const options = reply.result.configOptions;
+    assert.equal(options.find((option) => option.id === 'plan_mode').currentValue, value);
+    assert.equal(options.find((option) => option.id === 'permission_mode').currentValue, 'always-approve');
+  }
+  assert.ok(select(104, 'plan_mode', 'true').toClient[0].error);
 });
