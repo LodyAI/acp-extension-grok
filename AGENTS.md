@@ -39,3 +39,12 @@
   reverse ordering, and the bounded fallback. Do not depend on scheduler timing or a real runtime.
 - This settling happens inside the existing ACP process. It must not add Streams/Flock
   subscriptions or change connection cardinality.
+
+## Plan approval
+
+- Translate native plan approval only inside the wrapper, using standard ACP plan,
+  permission, and elicitation messages. Core owns the Plan toggle and elicitation
+  metadata; do not add a provider RPC or vocabulary to Lody business code.
+- Preserve the native request id and envelope. Only explicit approval may return
+  `approved`; errors and cancellation stay in Plan. Mode updates must refresh the
+  boolean config snapshot without changing permission policy.

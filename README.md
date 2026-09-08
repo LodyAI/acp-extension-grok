@@ -52,3 +52,21 @@ GROK_PATH=/path/to/official/grok node src/index.js
 ## Plan configuration
 
 Core’s boolean `plan_mode` option replaces the interaction-mode picker. The adapter maps it to the native default/plan session mode independently of `permission_mode`.
+
+## Plan review
+
+The native `x.ai/exit_plan_mode` reverse request is translated to standard ACP
+`plan_update` (when advertised) and a `session/request_permission` decision with
+`kind: switch_mode`. Older clients receive the plan in the approval tool's text
+content. Empty plans still require a decision. Approve, keep planning, and abandon
+map to the native `approved`, `cancelled`, and `abandoned` outcomes.
+
+When the client advertises form elicitation, keep planning opens an optional
+`elicitation/create` feedback form using Core's `_meta.lody.elicitation` contract.
+Dismissal, errors, and session cancellation never approve a plan. Native mode
+updates refresh Core's boolean `plan_mode` config option. The adapter does not
+change permission policy when reviewing a plan.
+
+Hosts must keep `switch_mode` decisions interactive, including when their tool
+permission policy is Always Approve. Release this adapter with that host change;
+ordinary tool auto-approval is not consent to implement a plan.
