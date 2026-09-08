@@ -1,5 +1,5 @@
 import runtimeManifest from '../runtime-manifest.json' with { type: 'json' };
-import { LODY_EXTENSION_METHODS } from 'acp-extension-core';
+import { LODY_EXTENSION_METHODS, LODY_PLAN_MODE_CONFIG_ID, createPlanModeConfigOption } from 'acp-extension-core';
 
 const contract = runtimeManifest.privateWireContract;
 
@@ -585,7 +585,7 @@ export class GrokAcpCompatibilityProxy {
 
     const { sessionId, configId, value } = params;
     const state = this.sessions.get(sessionId);
-    if (!state || typeof value !== 'string') {
+    if (!state || (configId === LODY_PLAN_MODE_CONFIG_ID ? typeof value !== 'boolean' : typeof value !== 'string')) {
       return {
         toRuntime: [],
         toClient: [errorResponse(message.id, 'Unknown Grok session or invalid config value')],
@@ -657,8 +657,10 @@ export class GrokAcpCompatibilityProxy {
         method: 'session/set_model',
         params: { sessionId, modelId: value },
       };
-    } else if (configId === 'interaction_mode') {
-      effectiveValue = LEGACY_INTERACTION_ALIASES[value] ?? value;
+    } else if (configId === LODY_PLAN_MODE_CONFIG_ID || configId === 'interaction_mode') {
+      effectiveValue = configId === LODY_PLAN_MODE_CONFIG_ID
+        ? (value ? 'plan' : 'agent')
+        : (LEGACY_INTERACTION_ALIASES[value] ?? value);
       const modeId = INTERACTION_TO_RUNTIME[effectiveValue];
       if (!modeId) return unsupportedConfigOption(message.id, configId);
       translated = {
@@ -796,7 +798,7 @@ export class GrokAcpCompatibilityProxy {
     if (!state) return { toRuntime: [], toClient: [message] };
     if (pending.configId === 'model') this.applyCurrentModel(state, pending.value);
     if (pending.configId === 'reasoning_effort') state.reasoningEffort = pending.value;
-    if (pending.configId === 'interaction_mode') state.interactionMode = pending.value;
+    if (pending.configId === LODY_PLAN_MODE_CONFIG_ID || pending.configId === 'interaction_mode') state.interactionMode = pending.value;
     return {
       toRuntime: [],
       toClient: [
@@ -910,18 +912,6 @@ export class GrokAcpCompatibilityProxy {
   }
 
   configOptions(state) {
-    const modes = [
-      {
-        value: 'agent',
-        name: 'Agent',
-        description: 'Use tools and make changes when needed',
-      },
-      {
-        value: 'plan',
-        name: 'Plan',
-        description: 'Plan without modifying the workspace',
-      },
-    ];
     const permissions = [
       {
         value: 'ask',
@@ -942,14 +932,7 @@ export class GrokAcpCompatibilityProxy {
       });
     }
     const options = [
-      selectOption(
-        'interaction_mode',
-        'Interaction Mode',
-        'Controls how Grok works',
-        state.interactionMode,
-        modes,
-        'mode'
-      ),
+      createPlanModeConfigOption(state.interactionMode === 'plan'),
       selectOption(
         'permission_mode',
         'Permission Mode',
