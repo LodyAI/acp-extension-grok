@@ -1,6 +1,6 @@
 {
   "name": "acp-extension-grok",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "ACP compatibility adapter for the official Grok runtime",
   "type": "module",
   "main": "src/index.js",
