@@ -10,14 +10,16 @@ configuration options.
 Supported configuration:
 
 - Initial permission mode from `_meta.lody.sessionConfig` maps to Grok's
-  startup `_meta.yoloMode` and `_meta.autoMode` (both explicit, including false)
-  before `session/new` or restore reaches the official
-  runtime. Later changes map to `x.ai/yolo_mode_changed` with the current Lody
-  `clientIdentifier`, which is registered during ACP initialization. Grok's
-  native standard `session/request_permission` requests pass through unchanged.
-  Like the official TUI, Lody answers tool permissions with `allow_once` while
-  Always Approve is selected and drains waiting requests when it is enabled.
-  Keeping that handling in Lody also resolves its durable history and waiting UI.
+  startup `_meta.yoloMode` before `session/new` or restore reaches the official
+  runtime, with `_meta.autoMode=false`. Later changes map to
+  `x.ai/yolo_mode_changed` with the current Lody `clientIdentifier`, which is
+  registered during ACP initialization. In Always Approve (YOLO), the adapter
+  answers native `session/request_permission` requests directly: prefer
+  `allow_once`, then `allow_always` if no single-use allow option exists. These
+  requests are not forwarded to the client, preventing approval UI flicker.
+  The latter option may persist a grant in the official runtime. Questions,
+  mode-switch decisions, requests for unknown sessions, and requests without a usable allow option
+  remain interactive.
 - Reasoning effort maps to `session/set_model`, preserving the current model and
   setting `_meta.reasoningEffort`.
 - Model and interaction mode map to the corresponding standard legacy ACP calls.
@@ -39,9 +41,12 @@ Supported configuration:
   but omits the percentage, the adapter mirrors the official `/usage` UI's weekly `0%`.
   Billing failures never fail a session.
 
-Automatic permission mode is exposed as an experimental option. The official
-1.0.13 runtime accepts the private `auto_mode` notification but does not
-acknowledge it, so the adapter applies the selection optimistically.
+Only Ask and Always Approve are advertised. Retired Auto selections in startup
+metadata restore as Ask; live attempts to select Auto are rejected. Permission
+changes still use an unacknowledged native notification, so the returned config
+snapshot represents the adapter's accepted policy, not a runtime acknowledgement.
+The fallback applies to incoming requests; requests already forwarded to a client
+remain owned by that client. Standard elicitation requests pass through unchanged.
 
 Run with:
 

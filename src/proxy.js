@@ -10,7 +10,6 @@ const contract = runtimeManifest.privateWireContract;
 
 const PERMISSION_MODES = {
   ask: { permission_mode: 'ask', yolo_mode: false, auto_mode: false },
-  auto: { permission_mode: 'auto', yolo_mode: false, auto_mode: true },
   'always-approve': {
     permission_mode: 'always-approve',
     yolo_mode: true,
@@ -340,7 +339,9 @@ function readLodySessionConfigOption(meta, configId) {
 
 function translateSessionStart(message) {
   const params = message.params ?? {};
-  const permissionMode = readLodySessionConfigOption(params._meta, 'permission_mode');
+  const requestedMode = readLodySessionConfigOption(params._meta, 'permission_mode');
+  // Retired Auto selections restore conservatively; never upgrade them to YOLO.
+  const permissionMode = requestedMode === 'auto' ? 'ask' : requestedMode;
   const mapped = typeof permissionMode === 'string' ? PERMISSION_MODES[permissionMode] : undefined;
   if (!mapped) return { message, permissionMode: undefined };
 
@@ -351,7 +352,7 @@ function translateSessionStart(message) {
       _meta: {
         ...stripLodySessionConfig(params._meta),
         yoloMode: mapped.yolo_mode,
-        autoMode: mapped.auto_mode,
+        autoMode: false,
       },
     },
   };
@@ -372,7 +373,7 @@ export class GrokAcpCompatibilityProxy {
     this.latestModelSnapshot = undefined;
     this.latestModelSnapshotFingerprint = undefined;
     this.deferSessionResponseUntilModelSnapshot = deferSessionResponseUntilModelSnapshot;
-    // Grok scopes yolo/auto mode to the Lody clientIdentifier, not to a session,
+    // Grok scopes permission mode to the Lody clientIdentifier, not to a session,
     // so the selection outlives any single session and is stored by client.
     this.permissionModes = new Map();
     this.nextInternalRequestId = Number.MAX_SAFE_INTEGER;
@@ -399,14 +400,14 @@ export class GrokAcpCompatibilityProxy {
     state.reasoningEfforts = reasoningEfforts;
     state.reasoningEffort =
       typeof reportedReasoningEffort === 'string' &&
-        reasoningEfforts.includes(reportedReasoningEffort)
+      reasoningEfforts.includes(reportedReasoningEffort)
         ? reportedReasoningEffort
         : previousModelId === currentModelId && reasoningEfforts.includes(state.reasoningEffort)
           ? state.reasoningEffort
           : typeof metadataReasoningEffort === 'string' &&
-                reasoningEfforts.includes(metadataReasoningEffort)
-              ? metadataReasoningEffort
-              : reasoningEfforts[0];
+              reasoningEfforts.includes(metadataReasoningEffort)
+            ? metadataReasoningEffort
+            : reasoningEfforts[0];
   }
 
   applyModelSnapshot(state, snapshot) {
@@ -612,16 +613,8 @@ export class GrokAcpCompatibilityProxy {
     }
 
     if (configId === 'permission_mode') {
-      if (value === 'auto' && !contract.autoPermissionMode) {
-        return {
-          toRuntime: [],
-          toClient: [
-            errorResponse(
-              message.id,
-              'Auto permission mode is unavailable in the pinned Grok runtime'
-            ),
-          ],
-        };
+      if (!Object.hasOwn(PERMISSION_MODES, value)) {
+        return unsupportedConfigOption(message.id, configId);
       }
       const notification = permissionNotification(state.clientIdentifier, value);
       if (!notification || !state.clientIdentifier) {
@@ -848,6 +841,36 @@ export class GrokAcpCompatibilityProxy {
     const state = this.sessions.get(sessionId);
     if (!state) return passthrough;
 
+    // YOLO is also a client-side policy in Grok. Resolve native permission
+    // requests here so clients never briefly render an unanswered request.
+    // Prefer a one-shot grant, but honor YOLO when only AllowAlways is offered.
+    if (
+      message.method === 'session/request_permission' &&
+      message.id !== undefined &&
+      this.permissionModes.get(state.clientIdentifier) === 'always-approve' &&
+      !message.params?._meta?.lody?.elicitation &&
+      message.params?.toolCall?.kind !== 'switch_mode' &&
+      Array.isArray(message.params?.options)
+    ) {
+      const options = message.params.options;
+      const isSelectable = (option) => typeof option?.optionId === 'string';
+      const allow =
+        options.find((option) => isSelectable(option) && option.kind === 'allow_once') ??
+        options.find((option) => isSelectable(option) && option.kind === 'allow_always');
+      if (allow) {
+        return {
+          toRuntime: [
+            {
+              jsonrpc: '2.0',
+              id: message.id,
+              result: { outcome: { outcome: 'selected', optionId: allow.optionId } },
+            },
+          ],
+          toClient: [],
+        };
+      }
+    }
+
     if (
       logicalMethod === contract.sessionUpdateNotification &&
       update?.sessionUpdate === contract.turnCompletedUpdate
@@ -967,13 +990,6 @@ export class GrokAcpCompatibilityProxy {
         description: 'Approve protected actions automatically',
       },
     ];
-    if (contract.autoPermissionMode) {
-      permissions.splice(1, 0, {
-        value: 'auto',
-        name: 'Auto',
-        description: 'Let Grok decide when approval is required',
-      });
-    }
     const options = [
       createPlanModeConfigOption(state.interactionMode === 'plan'),
       selectOption(

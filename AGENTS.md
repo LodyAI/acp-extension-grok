@@ -20,9 +20,8 @@
 - Seed both `yoloMode` and `autoMode`, including explicit false, on new/load/resume/fork.
   Pre-session notifications cannot configure a session that does not exist yet.
 - Live selections still use the client-scoped `x.ai/yolo_mode_changed` notification.
-  Forward native permissions unchanged: Lody owns the durable request and mirrors the
-  official TUI's `AllowOnce` response and pending queue drain for Always Approve.
-  Do not consume a pending request inside the adapter and leave Lody's UI waiting.
+  Resolve new YOLO tool permissions in the adapter as described below; requests
+  already forwarded to Lody remain owned by its durable permission flow.
 
 ## Model snapshot settling
 
@@ -48,3 +47,14 @@
 - Preserve the native request id and envelope. Only explicit approval may return
   `approved`; errors and cancellation stay in Plan. Mode updates must refresh the
   boolean config snapshot without changing permission policy.
+
+## Permission fallback
+
+- Advertise only Ask and Always Approve. Retired startup Auto restores as Ask;
+  reject live Auto selections and explicitly disable native auto mode.
+- For a known session in Always Approve, answer native permission requests in
+  the adapter, preferring `allow_once` then `allow_always`; match ACP option kinds,
+  never substrings in labels or ids. Only select an option supplied by the request.
+- Do not forward an automatically answered request to the client. Keep questions,
+  mode-switch decisions, unknown sessions, and requests without usable allow options interactive.
+- Never consume a pending client request when a reverse request uses the same id.

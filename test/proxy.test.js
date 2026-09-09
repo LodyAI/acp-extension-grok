@@ -132,7 +132,7 @@ test('pins and synthesizes the official 1.0.13 private wire contract', () => {
     response.result.configOptions
       .find((option) => option.id === 'permission_mode')
       .options.map((option) => option.value),
-    ['ask', 'auto', 'always-approve']
+    ['ask', 'always-approve']
   );
   assert.deepEqual(
     response.result.configOptions.find((option) => option.id === 'plan_mode')?.type,
@@ -304,12 +304,7 @@ test('maps every permission mode to the official notification contract', () => {
     yolo_mode: false,
     auto_mode: false,
   });
-  assert.deepEqual(permissionNotification(clientIdentifier, 'auto').params, {
-    clientIdentifier,
-    permission_mode: 'auto',
-    yolo_mode: false,
-    auto_mode: true,
-  });
+  assert.equal(permissionNotification(clientIdentifier, 'auto'), undefined);
   assert.deepEqual(permissionNotification(clientIdentifier, 'always-approve').params, {
     clientIdentifier,
     permission_mode: 'always-approve',
@@ -381,10 +376,10 @@ test('applies initial always-approve to restored sessions', () => {
   }
 });
 
-test('maps initial ask and auto permission modes at the session boundary', () => {
-  for (const [permissionMode, expectedAutoMode] of [
-    ['ask', false],
-    ['auto', true],
+test('restores retired Auto selections as Ask at the session boundary', () => {
+  for (const [permissionMode, expectedYoloMode, expectedRuntimeMessages] of [
+    ['ask', false, 1],
+    ['auto', false, 1],
   ]) {
     const proxy = new GrokAcpCompatibilityProxy();
     const output = proxy.handleClient({
@@ -405,13 +400,13 @@ test('maps initial ask and auto permission modes at the session boundary', () =>
         },
       },
     });
-    assert.equal(output.toRuntime.length, 1);
-    assert.equal(output.toRuntime[0].params._meta.yoloMode, false);
-    assert.equal(output.toRuntime[0].params._meta.autoMode, expectedAutoMode);
+    assert.equal(output.toRuntime.length, expectedRuntimeMessages);
+    assert.equal(output.toRuntime.at(-1).params._meta.yoloMode, expectedYoloMode);
+    assert.equal(output.toRuntime.at(-1).params._meta.autoMode, false);
     const response = proxy.handleRuntime(sessionResponse).toClient[0];
     assert.equal(
       response.result.configOptions.find((option) => option.id === 'permission_mode').currentValue,
-      permissionMode
+      'ask'
     );
   }
 });
@@ -438,30 +433,159 @@ test('optimistically syncs permission modes over the private extension notificat
   );
 });
 
-test('exposes experimental auto permission mode', () => {
+test('rejects live Auto selection without changing the active permission mode', () => {
   const { proxy } = readyProxy();
-  const output = proxy.handleClient({
+  setPermission(proxy, 'always-approve');
+  const output = setPermission(proxy, 'auto');
+  assert.equal(output.toRuntime.length, 0);
+  assert.ok(output.toClient[0].error);
+  assert.equal(proxy.handleRuntime(permissionRequest()).toClient.length, 0);
+});
+
+function setPermission(proxy, value) {
+  return proxy.handleClient({
     jsonrpc: '2.0',
-    id: 3,
+    id: 2,
     method: 'session/set_config_option',
+    params: { sessionId: 'grok-session', configId: 'permission_mode', value },
+  });
+}
+
+function permissionRequest(
+  options = [
+    { optionId: 'persistent', name: 'Yes for future calls', kind: 'allow_always' },
+    { optionId: 'single-use', name: 'Yes', kind: 'allow_once' },
+    { optionId: 'reject', name: 'No', kind: 'reject_once' },
+  ]
+) {
+  return {
+    jsonrpc: '2.0',
+    id: 77,
+    method: 'session/request_permission',
     params: {
       sessionId: 'grok-session',
-      configId: 'permission_mode',
-      value: 'auto',
+      toolCall: { toolCallId: 'synthetic-tool', title: 'Write file', kind: 'edit' },
+      options,
     },
+  };
+}
+
+function assertAutomatic(output, optionId, id = 77) {
+  assert.deepEqual(output, {
+    toRuntime: [
+      {
+        jsonrpc: '2.0',
+        id,
+        result: { outcome: { outcome: 'selected', optionId } },
+      },
+    ],
+    toClient: [],
   });
-  assert.equal(output.toRuntime[0].method, '_x.ai/yolo_mode_changed');
-  assert.deepEqual(output.toRuntime[0].params, {
-    clientIdentifier,
-    permission_mode: 'auto',
-    yolo_mode: false,
-    auto_mode: true,
+}
+
+test('YOLO approves once without forwarding a permission request to the client', () => {
+  const { proxy } = readyProxy();
+  setPermission(proxy, 'always-approve');
+  assertAutomatic(proxy.handleRuntime(permissionRequest()), 'single-use');
+  assertAutomatic(proxy.handleRuntime(permissionRequest()), 'single-use');
+  setPermission(proxy, 'ask');
+  const request = permissionRequest();
+  assert.deepEqual(proxy.handleRuntime(request), { toRuntime: [], toClient: [request] });
+});
+
+test('YOLO selects AllowAlways when it is the only allow kind', () => {
+  const { proxy } = readyProxy();
+  setPermission(proxy, 'always-approve');
+  const request = permissionRequest([
+    { optionId: 'reject', name: 'No', kind: 'reject_once' },
+    { optionId: 'persistent', name: 'Yes', kind: 'allow_always' },
+  ]);
+  assertAutomatic(proxy.handleRuntime(request), 'persistent');
+});
+
+test('startup YOLO enables the fallback without a live config setter', () => {
+  for (const method of ['session/new', 'session/load', 'session/resume', 'session/fork']) {
+    const proxy = new GrokAcpCompatibilityProxy();
+    proxy.handleClient({
+      jsonrpc: '2.0',
+      id: 1,
+      method,
+      params: {
+        cwd: '/tmp/project',
+        mcpServers: [],
+        _meta: {
+          clientIdentifier,
+          lody: {
+            sessionConfig: {
+              version: 1,
+              configOptionValues: { permission_mode: 'always-approve' },
+            },
+          },
+        },
+      },
+    });
+    proxy.handleRuntime(sessionResponse);
+    assertAutomatic(proxy.handleRuntime(permissionRequest()), 'single-use');
+  }
+});
+
+test('YOLO leaves questions, unknown sessions, and requests without usable allow kinds interactive', () => {
+  const { proxy } = readyProxy();
+  setPermission(proxy, 'always-approve');
+  const question = permissionRequest();
+  question.params._meta = { lody: { elicitation: { version: 1, questions: [] } } };
+  const modeSwitch = permissionRequest();
+  modeSwitch.params.toolCall.kind = 'switch_mode';
+  const unknownSession = permissionRequest();
+  unknownSession.params.sessionId = 'other-session';
+  const notification = permissionRequest();
+  delete notification.id;
+  for (const request of [
+    question,
+    modeSwitch,
+    unknownSession,
+    notification,
+    permissionRequest([{ optionId: 'disallow', name: 'Allow', kind: 'reject_once' }]),
+    permissionRequest([{ name: 'Yes', kind: 'allow_once' }]),
+    permissionRequest([]),
+    permissionRequest(null),
+  ]) {
+    assert.deepEqual(proxy.handleRuntime(request), { toRuntime: [], toClient: [request] });
+  }
+});
+
+test('YOLO does not approve requests for another known client in Ask mode', () => {
+  const { proxy } = readyProxy();
+  setPermission(proxy, 'always-approve');
+  proxy.handleClient({
+    jsonrpc: '2.0',
+    id: 9,
+    method: 'session/new',
+    params: { cwd: '/tmp/other', mcpServers: [], _meta: { clientIdentifier: 'lody:other' } },
   });
-  assert.equal(
-    output.toClient[0].result.configOptions.find((option) => option.id === 'permission_mode')
-      .currentValue,
-    'auto'
-  );
+  proxy.handleRuntime({
+    ...sessionResponse,
+    id: 9,
+    result: { ...sessionResponse.result, sessionId: 'other' },
+  });
+  const request = permissionRequest();
+  request.params.sessionId = 'other';
+  assert.deepEqual(proxy.handleRuntime(request), { toRuntime: [], toClient: [request] });
+  assertAutomatic(proxy.handleRuntime(permissionRequest()), 'single-use');
+});
+
+test('reverse permission IDs do not consume a pending client request with the same ID', () => {
+  const { proxy } = readyProxy();
+  setPermission(proxy, 'always-approve');
+  proxy.handleClient({
+    jsonrpc: '2.0',
+    id: 77,
+    method: 'session/prompt',
+    params: { sessionId: 'grok-session', prompt: [] },
+  });
+  assertAutomatic(proxy.handleRuntime(permissionRequest()), 'single-use');
+  const response = { jsonrpc: '2.0', id: 77, result: { stopReason: 'end_turn' } };
+  assert.ok(proxy.handleRuntime(response).toClient.some((message) => message.id === 77));
 });
 
 test('passes Grok native ACP permission requests and responses through unchanged', () => {
@@ -513,8 +637,7 @@ test('safely degrades a legacy Ask interaction selection to Plan across response
   });
   const modeResponse = proxy.handleRuntime({ jsonrpc: '2.0', id: 31, result: {} }).toClient[0];
   assert.equal(
-    modeResponse.result.configOptions.find((option) => option.id === 'plan_mode')
-      .currentValue,
+    modeResponse.result.configOptions.find((option) => option.id === 'plan_mode').currentValue,
     true
   );
   const response = proxy.handleClient({
@@ -529,8 +652,7 @@ test('safely degrades a legacy Ask interaction selection to Plan across response
     result: {},
   }).toClient[0];
   assert.equal(
-    configResponse.result.configOptions.find((option) => option.id === 'plan_mode')
-      .currentValue,
+    configResponse.result.configOptions.find((option) => option.id === 'plan_mode').currentValue,
     true
   );
   assert.equal(response.toRuntime[0].method, 'session/set_model');
@@ -745,9 +867,9 @@ test('rebuilds the reasoning-effort ladder when the runtime changes the model', 
   assert.equal(changed.toClient[0].method, 'session/update');
   assert.equal(changed.toClient[0].params.update.sessionUpdate, 'config_option_update');
   assert.equal(
-    changed.toClient[0].params.update.configOptions
-      .find((option) => option.id === 'reasoning_effort')
-      .currentValue,
+    changed.toClient[0].params.update.configOptions.find(
+      (option) => option.id === 'reasoning_effort'
+    ).currentValue,
     'medium'
   );
 
@@ -1208,22 +1330,30 @@ test('does not record or re-query historical usage from replayed completions', (
   assert.equal(replay.toRuntime.length, 0);
 });
 
-
 test('Plan boolean switches preserve Always Approve and reject strings', () => {
   const { proxy } = readyProxy();
-  const select = (id, configId, value) => proxy.handleClient({
-    jsonrpc: '2.0', id, method: 'session/set_config_option',
-    params: { sessionId: 'grok-session', configId, value },
-  });
+  const select = (id, configId, value) =>
+    proxy.handleClient({
+      jsonrpc: '2.0',
+      id,
+      method: 'session/set_config_option',
+      params: { sessionId: 'grok-session', configId, value },
+    });
   select(101, 'permission_mode', 'always-approve');
-  for (const [id, value] of [[102, true], [103, false]]) {
+  for (const [id, value] of [
+    [102, true],
+    [103, false],
+  ]) {
     const request = select(id, 'plan_mode', value).toRuntime[0];
     assert.equal(request.method, 'session/set_mode');
     assert.equal(request.params.modeId, value ? 'plan' : 'default');
     const reply = proxy.handleRuntime({ jsonrpc: '2.0', id, result: {} }).toClient[0];
     const options = reply.result.configOptions;
     assert.equal(options.find((option) => option.id === 'plan_mode').currentValue, value);
-    assert.equal(options.find((option) => option.id === 'permission_mode').currentValue, 'always-approve');
+    assert.equal(
+      options.find((option) => option.id === 'permission_mode').currentValue,
+      'always-approve'
+    );
   }
   assert.ok(select(104, 'plan_mode', 'true').toClient[0].error);
 });
