@@ -28,7 +28,11 @@ Supported configuration:
   Plan.
 - Per-turn token and trusted cost totals from Grok's prompt metadata or durable
   `_x.ai/session/update` `turn_completed` event map to Core's
-  `_lody/session/usage_update` extension. Cache and reasoning totals are
+  `_lody/session/usage_update` extension. Per-prompt model rows are accumulated
+  across the ACP accounting lifetime and emitted with already-included deltas.
+  Repeated prompt IDs can complete earlier partial statistics without being
+  counted twice. Reports without IDs/model rows cannot be safely attributed.
+  Core 0.1.5 must be published before this adapter release. Cache and reasoning totals are
   converted from Grok's inclusive counters into Lody's disjoint buckets.
 - The adapter queries `x.ai/session/info` after session setup and completed
   prompts, then emits standard ACP `usage_update` context-window updates. Replay
