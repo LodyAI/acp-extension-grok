@@ -2,6 +2,15 @@
 
 `CLAUDE.md` is a symlink to this file. The public Lody repository guidelines also apply.
 
+## Usage accounting
+
+- Accumulate native per-prompt model usage in Core's session accumulator across
+  both completion channels. Stable prompt IDs deduplicate and permit monotonic
+  incomplete-to-complete corrections. Replay adds nothing; no model map means
+  no invented model attribution. Preserve the ledger across model/config changes.
+- Cumulative `modelUsage` and optional `delta` carry the same contribution at
+  different scopes. Do not restore first-result-wins or client-side delta summing.
+
 ## Per-model reasoning-effort ladders
 
 - The reasoning-effort list is the SELECTED model's ladder, re-derived from that

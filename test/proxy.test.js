@@ -1043,10 +1043,11 @@ test('emits Lody token usage and requests authoritative context on turn completi
 
   assert.equal(output.toClient[0].method, '_x.ai/session/update');
   assert.equal(output.toClient[1].method, '_lody/session/usage_update');
-  assert.deepEqual(output.toClient[1].params, {
-    sessionId: 'grok-session',
-    ...normalizePromptUsage(promptUsage),
-  });
+  const reported = output.toClient[1].params;
+  assert.equal(reported.sessionId, 'grok-session');
+  assert.deepEqual(reported.usage, normalizePromptUsage(promptUsage).usage);
+  assert.equal(reported.modelUsage['grok-build'].inputTokens, 600);
+  assert.deepEqual(reported.delta.modelUsage, reported.modelUsage);
   assert.equal(output.toRuntime.length, 2);
   assert.equal(output.toRuntime[0].method, '_x.ai/session/info');
   assert.deepEqual(output.toRuntime[0].params, { sessionId: 'grok-session' });
@@ -1081,6 +1082,35 @@ test('converts session info context into standard ACP usage_update for the exist
       },
     },
   ]);
+});
+
+test('accumulates distinct prompts and repairs incomplete-first usage without replaying deltas', () => {
+  const { proxy } = readyProxy();
+  const complete = (id, usage, replay = false) =>
+    proxy
+      .handleRuntime({
+        jsonrpc: '2.0',
+        method: '_x.ai/session/update',
+        params: {
+          sessionId: 'grok-session',
+          _meta: { isReplay: replay },
+          update: { sessionUpdate: 'turn_completed', prompt_id: id, usage },
+        },
+      })
+      .toClient.find((message) => message.method === '_lody/session/usage_update')?.params;
+  const incomplete = complete('one', { ...promptUsage, usageIsIncomplete: true });
+  assert.equal(incomplete.modelUsage['grok-build'].costUSD, undefined);
+  const repaired = complete('one', promptUsage);
+  assert.equal(repaired.modelUsage['grok-build'].inputTokens, 600);
+  assert.equal(repaired.modelUsage['grok-build'].costUSD, 0.025);
+  assert.equal(repaired.delta.usage.inputTokens, 0);
+  assert.equal(complete('one', promptUsage), undefined);
+  assert.equal(complete('history', promptUsage, true), undefined);
+  const second = complete('two', promptUsage);
+  assert.equal(second.modelUsage['grok-build'].inputTokens, 1200);
+  assert.equal(second.modelUsage['grok-build'].costUSD, 0.05);
+  assert.equal(second.delta.usage.inputTokens, 600);
+  assert.equal(second.usage.inputTokens, 600);
 });
 
 test('converts official Grok billing into Lody session rate limits', () => {

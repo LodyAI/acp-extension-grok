@@ -4,6 +4,7 @@ import {
   LODY_EXTENSION_METHODS,
   LODY_PLAN_MODE_CONFIG_ID,
   createPlanModeConfigOption,
+  SessionUsageAccumulator,
 } from 'acp-extension-core';
 
 const contract = runtimeManifest.privateWireContract;
@@ -155,13 +156,6 @@ export function normalizePromptUsage(promptUsage) {
     usage,
     ...(Object.keys(modelUsage).length ? { modelUsage } : {}),
   };
-}
-
-function usageNotification(sessionId, promptUsage) {
-  const params = normalizePromptUsage(promptUsage);
-  return (
-    params && lodyNotification(LODY_EXTENSION_METHODS.sessionUsageUpdate, { sessionId, ...params })
-  );
 }
 
 export function normalizeBillingRateLimits(billing) {
@@ -535,10 +529,18 @@ export class GrokAcpCompatibilityProxy {
   }
 
   usageForPrompt(state, promptId, promptUsage) {
-    const notification = usageNotification(state.sessionId, promptUsage);
-    if (!notification) return undefined;
-    if (!rememberPrompt(state.usagePromptIds, promptId)) return undefined;
-    return notification;
+    const normalized = normalizePromptUsage(promptUsage);
+    // Both native completion channels must identify the same prompt. Without
+    // an ID we cannot safely distinguish another request from a replay.
+    if (!normalized || promptId == null) return undefined;
+    const modelUsage = normalized.modelUsage;
+    // Do not invent model attribution for multi-model prompts. A later complete
+    // snapshot can fill in missing rows without first-result-wins deduplication.
+    if (!modelUsage) return undefined;
+    const update = state.usageAccumulator.update(state.sessionId, String(promptId), modelUsage);
+    if (!update) return undefined;
+    update.usage = normalized.usage;
+    return lodyNotification(LODY_EXTENSION_METHODS.sessionUsageUpdate, update);
   }
 
   handleClient(message) {
@@ -972,7 +974,7 @@ export class GrokAcpCompatibilityProxy {
         legacyEfforts.find((option) => option.selected)?.id ??
         old?.reasoningEffort ??
         reasoningEfforts[0],
-      usagePromptIds: old?.usagePromptIds ?? new Set(),
+      usageAccumulator: old?.usageAccumulator ?? new SessionUsageAccumulator(),
       usageRefreshPromptIds: old?.usageRefreshPromptIds ?? new Set(),
     };
   }
