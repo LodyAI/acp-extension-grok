@@ -101,8 +101,8 @@ const promptUsage = {
   usageIsIncomplete: false,
 };
 
-test('pins and synthesizes the official 1.0.13 private wire contract', () => {
-  assert.equal(runtimeManifest.officialRuntime.minimumSupportedVersion, '1.0.13');
+test('pins and synthesizes the official 1.0.34 private wire contract', () => {
+  assert.equal(runtimeManifest.officialRuntime.minimumSupportedVersion, '1.0.34');
   assert.deepEqual(
     {
       sessionUpdateNotification: runtimeManifest.privateWireContract.sessionUpdateNotification,

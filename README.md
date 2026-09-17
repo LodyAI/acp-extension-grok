@@ -23,7 +23,7 @@ Supported configuration:
 - Reasoning effort maps to `session/set_model`, preserving the current model and
   setting `_meta.reasoningEffort`.
 - Model and interaction mode map to the corresponding standard legacy ACP calls.
-  Grok 1.0.13 reliably supports Agent and Plan. It silently ignores Ask, so the
+  The official Grok runtime reliably supports Agent and Plan. It silently ignores Ask, so the
   adapter does not advertise Ask and maps legacy persisted Ask selections to
   Plan.
 - Per-turn token and trusted cost totals from Grok's prompt metadata or durable
