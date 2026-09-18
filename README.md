@@ -20,12 +20,17 @@ Supported configuration:
   The latter option may persist a grant in the official runtime. Questions,
   mode-switch decisions, requests for unknown sessions, and requests without a usable allow option
   remain interactive.
-- Reasoning effort maps to `session/set_model`, preserving the current model and
-  setting `_meta.reasoningEffort`.
-- Model and interaction mode map to the corresponding standard legacy ACP calls.
-  Grok 1.0.13 reliably supports Agent and Plan. It silently ignores Ask, so the
+- Model and reasoning-effort selections use Grok's native standard
+  `session/set_config_option` contract. The adapter merges the runtime's
+  `configOptions` and `config_option_update` snapshots with Lody's Plan and
+  Permission controls. A legacy `session/set_model` fallback remains for older
+  runtimes that do not publish the standard options.
+- Interaction mode maps to the corresponding standard legacy ACP call.
+  Grok 1.0.34 reliably supports Agent and Plan. It silently ignores Ask, so the
   adapter does not advertise Ask and maps legacy persisted Ask selections to
   Plan.
+- Live `user_message_chunk` echo is explicitly disabled through
+  `x.ai/userMessageEcho`; Lody already owns rendering the submitted prompt.
 - Per-turn token and trusted cost totals from Grok's prompt metadata or durable
   `_x.ai/session/update` `turn_completed` event map to Core's
   `_lody/session/usage_update` extension. Per-prompt model rows are accumulated
