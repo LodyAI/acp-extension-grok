@@ -20,7 +20,7 @@ const PERMISSION_MODES = {
 
 const INTERACTION_TO_RUNTIME = { agent: 'default', plan: 'plan' };
 const INTERACTION_FROM_RUNTIME = { default: 'agent', plan: 'plan', ask: 'plan' };
-// Grok 1.0.13 silently accepts `ask` without changing its runtime mode. Keep
+// Grok 1.0.34 silently accepts `ask` without changing its runtime mode. Keep
 // legacy persisted Ask selections safe by degrading them to Plan, but do not
 // advertise Ask until the runtime reports and applies it.
 const LEGACY_INTERACTION_ALIASES = { ask: 'plan' };
@@ -84,7 +84,7 @@ function billingUsagePercent(config, period) {
   );
   if (limit && used !== undefined) return (used / limit) * 100;
 
-  // Grok Build 1.0.13 omits creditUsagePercent for a fresh unified-billing
+  // Grok Build 1.0.34 omits creditUsagePercent for a fresh unified-billing
   // weekly period and reports each balance field as an explicit zero. Its own
   // `/usage` UI renders that exact response as "Weekly limit: 0%", so mirror
   // the official client only for this fully-zero, provider-authored shape.
@@ -253,12 +253,70 @@ function legacyOptions(result) {
   return Array.isArray(options) ? options : [];
 }
 
-function readReasoningEfforts(model) {
+function readReasoningOptions(model) {
   const raw = model?._meta?.reasoningEfforts ?? model?._meta?.reasoning_efforts;
   if (!Array.isArray(raw)) return [];
   return raw
-    .map((item) => (typeof item === 'string' ? item : (item?.id ?? item?.reasoningEffort)))
-    .filter((item) => typeof item === 'string');
+    .map((item) => {
+      if (typeof item === 'string') {
+        return {
+          id: item,
+          value: item,
+          name: optionName(item),
+          description: null,
+          default: false,
+        };
+      }
+      const id = item?.id ?? item?.reasoningEffort ?? item?.value;
+      const value = item?.value ?? item?.reasoningEffort ?? item?.id;
+      if (typeof id !== 'string' || typeof value !== 'string') return undefined;
+      return {
+        id,
+        value,
+        name: typeof item.label === 'string' ? item.label : optionName(id),
+        description: typeof item.description === 'string' ? item.description : null,
+        default: item.default === true,
+      };
+    })
+    .filter(Boolean);
+}
+
+function readReasoningEfforts(model) {
+  return readReasoningOptions(model).map((option) => option.id);
+}
+
+function reasoningOptionsFromConfig(option) {
+  if (!Array.isArray(option?.options)) return [];
+  return option.options
+    .map((item) => {
+      if (!item || typeof item.value !== 'string') return undefined;
+      return {
+        id: item.value,
+        value: item.value,
+        name: typeof item.name === 'string' ? item.name : optionName(item.value),
+        description: typeof item.description === 'string' ? item.description : null,
+        default: false,
+      };
+    })
+    .filter(Boolean);
+}
+
+function reasoningSelector(options, reportedValue) {
+  if (typeof reportedValue !== 'string') return undefined;
+  return options.find((option) => option.id === reportedValue)?.id ??
+    options.find((option) => option.value === reportedValue)?.id;
+}
+
+function standardConfigOptions(result) {
+  return Array.isArray(result?.configOptions)
+    ? result.configOptions.filter(
+        (option) => option && typeof option === 'object' && typeof option.id === 'string'
+      )
+    : [];
+}
+
+function configOption(options, id) {
+  return options.find((option) => option.id === id);
 }
 
 function readModelSnapshot(params) {
@@ -356,6 +414,24 @@ function translateSessionStart(message) {
   };
 }
 
+function translateInitialize(message) {
+  const params = message.params ?? {};
+  const clientCapabilities = params.clientCapabilities ?? {};
+  return {
+    ...message,
+    params: {
+      ...params,
+      clientCapabilities: {
+        ...clientCapabilities,
+        _meta: {
+          ...(clientCapabilities._meta ?? {}),
+          [contract.userMessageEchoCapability]: false,
+        },
+      },
+    },
+  };
+}
+
 export class GrokAcpCompatibilityProxy {
   constructor({ deferSessionResponseUntilModelSnapshot = false } = {}) {
     this.sessions = new Map();
@@ -376,7 +452,8 @@ export class GrokAcpCompatibilityProxy {
   applyCurrentModel(state, currentModelId, reportedReasoningEffort) {
     const previousModelId = state.currentModelId;
     const currentModel = state.models.find((model) => model.modelId === currentModelId);
-    const reasoningEfforts = readReasoningEfforts(currentModel);
+    const reasoningOptions = readReasoningOptions(currentModel);
+    const reasoningEfforts = reasoningOptions.map((option) => option.id);
     const metadataReasoningEffort =
       currentModel?._meta?.reasoningEffort ?? currentModel?._meta?.reasoning_effort;
     state.currentModelId = currentModelId;
@@ -385,23 +462,86 @@ export class GrokAcpCompatibilityProxy {
       // control: the previous model's list must not masquerade as validated
       // values for the new one. A repeat for the same model keeps whatever
       // the session already reported.
-      if (previousModelId !== currentModelId) state.reasoningEfforts = [];
+      if (previousModelId !== currentModelId) {
+        state.reasoningOptions = [];
+        state.reasoningEfforts = [];
+      }
       if (typeof reportedReasoningEffort === 'string') {
         state.reasoningEffort = reportedReasoningEffort;
       }
       return;
     }
+    state.reasoningOptions = reasoningOptions;
     state.reasoningEfforts = reasoningEfforts;
+    const reportedValue =
+      reasoningSelector(reasoningOptions, reportedReasoningEffort) ??
+      (typeof reportedReasoningEffort === 'string' ? reportedReasoningEffort : undefined);
+    const metadataValue =
+      reasoningSelector(reasoningOptions, metadataReasoningEffort) ??
+      (typeof metadataReasoningEffort === 'string' ? metadataReasoningEffort : undefined);
     state.reasoningEffort =
-      typeof reportedReasoningEffort === 'string' &&
-      reasoningEfforts.includes(reportedReasoningEffort)
-        ? reportedReasoningEffort
-        : previousModelId === currentModelId && reasoningEfforts.includes(state.reasoningEffort)
+      reportedValue !== undefined
+        ? reportedValue
+        : previousModelId === currentModelId && typeof state.reasoningEffort === 'string'
           ? state.reasoningEffort
-          : typeof metadataReasoningEffort === 'string' &&
-              reasoningEfforts.includes(metadataReasoningEffort)
-            ? metadataReasoningEffort
-            : reasoningEfforts[0];
+          : (metadataValue ??
+            reasoningOptions.find((option) => option.default)?.id ??
+            reasoningEfforts[0]);
+  }
+
+  applyRuntimeConfigOptions(state, options) {
+    if (!Array.isArray(options)) return;
+    state.runtimeConfigOptions = options.filter(
+      (option) =>
+        option &&
+        typeof option === 'object' &&
+        typeof option.id === 'string' &&
+        option.id !== LODY_PLAN_MODE_CONFIG_ID &&
+        option.id !== 'permission_mode' &&
+        option.id !== 'interaction_mode'
+    );
+
+    const modelOption = configOption(state.runtimeConfigOptions, 'model');
+    if (Array.isArray(modelOption?.options)) {
+      state.models = modelOption.options
+        .filter((option) => option && typeof option.value === 'string')
+        .map((option) => {
+          const existing = state.models.find((model) => model.modelId === option.value);
+          return {
+            ...(existing ?? {}),
+            modelId: option.value,
+            name:
+              typeof option.name === 'string'
+                ? option.name
+                : (existing?.name ?? option.value),
+            description: option.description ?? existing?.description,
+          };
+        });
+    }
+    if (typeof modelOption?.currentValue === 'string') {
+      this.applyCurrentModel(state, modelOption.currentValue);
+    }
+
+    const reasoningOption = configOption(state.runtimeConfigOptions, 'reasoning_effort');
+    if (!reasoningOption) return;
+    const currentModel = state.models.find((model) => model.modelId === state.currentModelId);
+    const metadataReasoningOptions = readReasoningOptions(currentModel);
+    if (metadataReasoningOptions.length) {
+      state.reasoningOptions = metadataReasoningOptions;
+      state.reasoningEfforts = metadataReasoningOptions.map((option) => option.id);
+    } else {
+      state.reasoningOptions = reasoningOptionsFromConfig(reasoningOption);
+      state.reasoningEfforts = state.reasoningOptions.map((option) => option.id);
+    }
+    const selected = reasoningSelector(state.reasoningOptions, reasoningOption.currentValue);
+    if (selected !== undefined) {
+      state.reasoningEffort = selected;
+    } else if (typeof reasoningOption.currentValue === 'string') {
+      // Grok deliberately reports real values such as `none` or `max` even
+      // when they are not selectable. Preserve that authoritative state while
+      // continuing to validate client selections against the published menu.
+      state.reasoningEffort = reasoningOption.currentValue;
+    }
   }
 
   applyModelSnapshot(state, snapshot) {
@@ -553,9 +693,10 @@ export class GrokAcpCompatibilityProxy {
       return { toRuntime: [...cancelled.toRuntime, message], toClient: cancelled.toClient };
     }
     if (message.method === 'initialize' && message.id !== undefined) {
-      this.clientCapabilities = params.clientCapabilities ?? {};
+      const translated = translateInitialize(message);
+      this.clientCapabilities = translated.params.clientCapabilities;
       this.pending.set(message.id, { kind: 'initialize' });
-      return { toRuntime: [message], toClient: [] };
+      return { toRuntime: [translated], toClient: [] };
     }
     if (message.method === LODY_EXTENSION_METHODS.rateLimitsGet) {
       return {
@@ -602,11 +743,12 @@ export class GrokAcpCompatibilityProxy {
 
     const { sessionId, configId, value } = params;
     const state = this.sessions.get(sessionId);
+    const runtimeOption = configOption(state?.runtimeConfigOptions ?? [], configId);
+    const expectsBoolean =
+      configId === LODY_PLAN_MODE_CONFIG_ID || runtimeOption?.type === 'boolean';
     if (
       !state ||
-      (configId === LODY_PLAN_MODE_CONFIG_ID
-        ? typeof value !== 'boolean'
-        : typeof value !== 'string')
+      (expectsBoolean ? typeof value !== 'boolean' : typeof value !== 'string')
     ) {
       return {
         toRuntime: [],
@@ -652,25 +794,30 @@ export class GrokAcpCompatibilityProxy {
           toClient: [errorResponse(message.id, 'Unsupported Grok reasoning effort')],
         };
       }
-      translated = {
-        jsonrpc: '2.0',
-        id: message.id,
-        method: 'session/set_model',
-        params: {
-          sessionId,
-          modelId: state.currentModelId,
-          _meta: {
-            [contract.reasoningEffortMeta]: value,
-          },
-        },
-      };
+      translated = configOption(state.runtimeConfigOptions, configId)
+        ? message
+        : {
+            jsonrpc: '2.0',
+            id: message.id,
+            method: 'session/set_model',
+            params: {
+              sessionId,
+              modelId: state.currentModelId,
+              _meta: {
+                [contract.reasoningEffortMeta]:
+                  state.reasoningOptions.find((option) => option.id === value)?.value ?? value,
+              },
+            },
+          };
     } else if (configId === 'model') {
-      translated = {
-        jsonrpc: '2.0',
-        id: message.id,
-        method: 'session/set_model',
-        params: { sessionId, modelId: value },
-      };
+      translated = configOption(state.runtimeConfigOptions, configId)
+        ? message
+        : {
+            jsonrpc: '2.0',
+            id: message.id,
+            method: 'session/set_model',
+            params: { sessionId, modelId: value },
+          };
     } else if (configId === LODY_PLAN_MODE_CONFIG_ID || configId === 'interaction_mode') {
       effectiveValue =
         configId === LODY_PLAN_MODE_CONFIG_ID
@@ -686,6 +833,8 @@ export class GrokAcpCompatibilityProxy {
         method: 'session/set_mode',
         params: { sessionId, modeId },
       };
+    } else if (configOption(state.runtimeConfigOptions, configId)) {
+      translated = message;
     } else {
       return unsupportedConfigOption(message.id, configId);
     }
@@ -813,17 +962,21 @@ export class GrokAcpCompatibilityProxy {
 
     const state = this.sessions.get(pending.sessionId);
     if (!state) return { toRuntime: [], toClient: [message] };
-    if (pending.configId === 'model') this.applyCurrentModel(state, pending.value);
-    if (pending.configId === 'reasoning_effort') state.reasoningEffort = pending.value;
-    if (pending.configId === LODY_PLAN_MODE_CONFIG_ID || pending.configId === 'interaction_mode')
-      state.interactionMode = pending.value;
+    if (message.error) return { toRuntime: [], toClient: [message] };
+    if (Array.isArray(message.result?.configOptions)) {
+      this.applyRuntimeConfigOptions(state, message.result.configOptions);
+    } else {
+      if (pending.configId === 'model') this.applyCurrentModel(state, pending.value);
+      if (pending.configId === 'reasoning_effort') state.reasoningEffort = pending.value;
+      if (pending.configId === LODY_PLAN_MODE_CONFIG_ID || pending.configId === 'interaction_mode')
+        state.interactionMode = pending.value;
+    }
     return {
       toRuntime: [],
       toClient: [
         {
-          jsonrpc: '2.0',
-          id: message.id,
-          result: { configOptions: this.configOptions(state) },
+          ...message,
+          result: { ...(message.result ?? {}), configOptions: this.configOptions(state) },
         },
       ],
     };
@@ -886,6 +1039,26 @@ export class GrokAcpCompatibilityProxy {
       };
     }
 
+    if (
+      message.method === 'session/update' &&
+      update?.sessionUpdate === 'config_option_update' &&
+      Array.isArray(update.configOptions)
+    ) {
+      this.applyRuntimeConfigOptions(state, update.configOptions);
+      return {
+        toRuntime: [],
+        toClient: [
+          {
+            ...message,
+            params: {
+              ...message.params,
+              update: { ...update, configOptions: this.configOptions(state) },
+            },
+          },
+        ],
+      };
+    }
+
     if (message.method === 'session/update' && update?.sessionUpdate === 'current_mode_update') {
       const interactionMode = INTERACTION_FROM_RUNTIME[update.currentModeId];
       if (!interactionMode) return passthrough;
@@ -918,8 +1091,20 @@ export class GrokAcpCompatibilityProxy {
       if (typeof modelId === 'string') {
         this.applyCurrentModel(state, modelId, reasoningEffort);
       }
+      const publishesStandardConfig =
+        configOption(state.runtimeConfigOptions, 'model') !== undefined ||
+        configOption(state.runtimeConfigOptions, 'reasoning_effort') !== undefined;
+      if (publishesStandardConfig) {
+        // Grok 1.0.34 emits a complete standard config_option_update directly
+        // after this private precursor. Keep the internal state current, but
+        // let that authoritative snapshot be the single client-visible update.
+        return {
+          toRuntime: [this.internalRequest('context', sessionId)],
+          toClient: [],
+        };
+      }
       // The vendor notification is not standard ACP and Lody ignores it, so
-      // the state change reaches the client as a standard config update.
+      // legacy sessions receive the state change as a standard config update.
       return {
         toRuntime: [this.internalRequest('context', sessionId)],
         toClient: [
@@ -946,17 +1131,37 @@ export class GrokAcpCompatibilityProxy {
     const legacy = legacyOptions(result);
     const legacyModels = legacy.filter((option) => option.category === 'model');
     const legacyEfforts = legacy.filter((option) => option.category === 'mode');
+    const hasRuntimeConfigOptions = Array.isArray(result.configOptions);
+    const runtimeConfigOptions = standardConfigOptions(result);
+    const runtimeModelOption = configOption(runtimeConfigOptions, 'model');
+    const runtimeReasoningOption = configOption(runtimeConfigOptions, 'reasoning_effort');
     const availableModels = result.models?.availableModels ?? [];
     const currentModelId =
       result.models?.currentModelId ??
+      runtimeModelOption?.currentValue ??
       legacyModels.find((option) => option.selected)?.id ??
       old?.currentModelId;
     const currentModel = availableModels.find((model) => model.modelId === currentModelId);
-    const metadataEfforts = readReasoningEfforts(currentModel);
-    const reasoningEfforts = metadataEfforts.length
-      ? metadataEfforts
-      : legacyEfforts.map((option) => option.id);
-    return {
+    const metadataReasoningOptions = readReasoningOptions(currentModel);
+    const runtimeReasoningOptions = reasoningOptionsFromConfig(runtimeReasoningOption);
+    const legacyReasoningOptions = legacyEfforts.map((option) => ({
+      id: option.id,
+      value: option.id,
+      name: option.label ?? optionName(option.id),
+      description: option.description ?? null,
+      default: false,
+    }));
+    const reasoningOptions = metadataReasoningOptions.length
+      ? metadataReasoningOptions
+      : runtimeReasoningOptions.length
+        ? runtimeReasoningOptions
+        : legacyReasoningOptions;
+    const reportedReasoningEffort =
+      runtimeReasoningOption?.currentValue ??
+      legacyEfforts.find((option) => option.selected)?.id ??
+      currentModel?._meta?.reasoningEffort ??
+      currentModel?._meta?.reasoning_effort;
+    const state = {
       sessionId,
       clientIdentifier: clientIdentifier ?? old?.clientIdentifier,
       interactionMode:
@@ -969,14 +1174,22 @@ export class GrokAcpCompatibilityProxy {
             name: option.label,
             description: option.description,
           })),
-      reasoningEfforts,
+      runtimeConfigOptions: hasRuntimeConfigOptions
+        ? runtimeConfigOptions
+        : (old?.runtimeConfigOptions ?? []),
+      reasoningOptions,
+      reasoningEfforts: reasoningOptions.map((option) => option.id),
       reasoningEffort:
-        legacyEfforts.find((option) => option.selected)?.id ??
+        reasoningSelector(reasoningOptions, reportedReasoningEffort) ??
+        (typeof reportedReasoningEffort === 'string' ? reportedReasoningEffort : undefined) ??
         old?.reasoningEffort ??
-        reasoningEfforts[0],
+        reasoningOptions.find((option) => option.default)?.id ??
+        reasoningOptions[0]?.id,
       usageAccumulator: old?.usageAccumulator ?? new SessionUsageAccumulator(),
       usageRefreshPromptIds: old?.usageRefreshPromptIds ?? new Set(),
     };
+    if (hasRuntimeConfigOptions) this.applyRuntimeConfigOptions(state, runtimeConfigOptions);
+    return state;
   }
 
   configOptions(state) {
@@ -1003,7 +1216,61 @@ export class GrokAcpCompatibilityProxy {
         '_permission'
       ),
     ];
-    if (state.currentModelId) {
+    const runtimeOptions = state.runtimeConfigOptions ?? [];
+    const emittedRuntimeIds = new Set();
+    for (const runtimeOption of runtimeOptions) {
+      if (runtimeOption.id === 'model') {
+        emittedRuntimeIds.add(runtimeOption.id);
+        options.push({
+          ...runtimeOption,
+          ...(state.currentModelId ? { currentValue: state.currentModelId } : {}),
+          ...(state.models.length
+            ? {
+                options: state.models.map((model) => {
+                  const published = runtimeOption.options?.find(
+                    (option) => option?.value === model.modelId
+                  );
+                  return {
+                    ...published,
+                    value: model.modelId,
+                    name: published?.name || model.name || model.modelId,
+                    description: published?.description ?? model.description ?? null,
+                  };
+                }),
+              }
+            : {}),
+        });
+      } else if (
+        runtimeOption.id === 'reasoning_effort' &&
+        state.reasoningOptions.length &&
+        state.reasoningEffort
+      ) {
+        emittedRuntimeIds.add(runtimeOption.id);
+        options.push({
+          ...runtimeOption,
+          ...(state.reasoningEffort ? { currentValue: state.reasoningEffort } : {}),
+          ...(state.reasoningOptions.length
+            ? {
+                options: state.reasoningOptions.map((option) => {
+                  const published = runtimeOption.options?.find(
+                    (candidate) => candidate?.value === option.id
+                  );
+                  return {
+                    ...published,
+                    value: option.id,
+                    name: published?.name || option.name || optionName(option.id),
+                    description: published?.description ?? option.description ?? null,
+                  };
+                }),
+              }
+            : {}),
+        });
+      } else if (runtimeOption.id !== 'model' && runtimeOption.id !== 'reasoning_effort') {
+        emittedRuntimeIds.add(runtimeOption.id);
+        options.push(runtimeOption);
+      }
+    }
+    if (state.currentModelId && !emittedRuntimeIds.has('model')) {
       options.push(
         selectOption(
           'model',
@@ -1019,17 +1286,21 @@ export class GrokAcpCompatibilityProxy {
         )
       );
     }
-    if (state.reasoningEfforts.length && state.reasoningEffort) {
+    if (
+      state.reasoningOptions.length &&
+      state.reasoningEffort &&
+      !emittedRuntimeIds.has('reasoning_effort')
+    ) {
       options.push(
         selectOption(
           'reasoning_effort',
           'Reasoning Effort',
           'Controls how much reasoning the model performs',
           state.reasoningEffort,
-          state.reasoningEfforts.map((value) => ({
-            value,
-            name: optionName(value),
-            description: null,
+          state.reasoningOptions.map((option) => ({
+            value: option.id,
+            name: option.name,
+            description: option.description,
           })),
           'thought_level'
         )

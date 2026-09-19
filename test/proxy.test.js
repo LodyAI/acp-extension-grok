@@ -18,6 +18,27 @@ const sessionResponse = {
       currentModelId: 'grok-build',
       availableModels: [{ modelId: 'grok-build', name: 'Grok Build' }],
     },
+    configOptions: [
+      {
+        id: 'model',
+        name: 'Model',
+        category: 'model',
+        type: 'select',
+        currentValue: 'grok-build',
+        options: [{ value: 'grok-build', name: 'Grok Build' }],
+      },
+      {
+        id: 'reasoning_effort',
+        name: 'Reasoning Effort',
+        category: 'thought_level',
+        type: 'select',
+        currentValue: 'high',
+        options: [
+          { value: 'low', name: 'Low' },
+          { value: 'high', name: 'High' },
+        ],
+      },
+    ],
     modes: { currentModeId: 'default' },
     _meta: {
       'x.ai/sessionConfig': {
@@ -35,6 +56,9 @@ const sessionResponse = {
     },
   },
 };
+
+const legacySessionResponse = structuredClone(sessionResponse);
+delete legacySessionResponse.result.configOptions;
 
 const modelSnapshot = {
   jsonrpc: '2.0',
@@ -64,7 +88,7 @@ const modelSnapshot = {
   },
 };
 
-function readyProxy() {
+function readyProxy(runtimeResponse = sessionResponse) {
   const proxy = new GrokAcpCompatibilityProxy();
   proxy.handleClient({
     jsonrpc: '2.0',
@@ -76,7 +100,7 @@ function readyProxy() {
       _meta: { clientIdentifier },
     },
   });
-  const startup = proxy.handleRuntime(sessionResponse);
+  const startup = proxy.handleRuntime(runtimeResponse);
   return { proxy, startup, response: startup.toClient[0] };
 }
 
@@ -101,8 +125,9 @@ const promptUsage = {
   usageIsIncomplete: false,
 };
 
-test('pins and synthesizes the official 1.0.13 private wire contract', () => {
-  assert.equal(runtimeManifest.officialRuntime.minimumSupportedVersion, '1.0.13');
+test('pins and adapts the official 1.0.34 wire contract', () => {
+  assert.equal(runtimeManifest.officialRuntime.version, '1.0.34');
+  assert.equal(runtimeManifest.officialRuntime.minimumSupportedVersion, '1.0.34');
   assert.deepEqual(
     {
       sessionUpdateNotification: runtimeManifest.privateWireContract.sessionUpdateNotification,
@@ -110,6 +135,7 @@ test('pins and synthesizes the official 1.0.13 private wire contract', () => {
       turnCompletedUpdate: runtimeManifest.privateWireContract.turnCompletedUpdate,
       sessionInfoRequest: runtimeManifest.privateWireContract.sessionInfoRequest,
       billingRequest: runtimeManifest.privateWireContract.billingRequest,
+      userMessageEchoCapability: runtimeManifest.privateWireContract.userMessageEchoCapability,
     },
     {
       sessionUpdateNotification: 'x.ai/session/update',
@@ -117,6 +143,7 @@ test('pins and synthesizes the official 1.0.13 private wire contract', () => {
       turnCompletedUpdate: 'turn_completed',
       sessionInfoRequest: 'x.ai/session/info',
       billingRequest: 'x.ai/billing',
+      userMessageEchoCapability: 'x.ai/userMessageEcho',
     }
   );
   const { response } = readyProxy();
@@ -138,6 +165,29 @@ test('pins and synthesizes the official 1.0.13 private wire contract', () => {
     response.result.configOptions.find((option) => option.id === 'plan_mode')?.type,
     'boolean'
   );
+});
+
+test('disables native user-message echo without dropping client capabilities', () => {
+  const proxy = new GrokAcpCompatibilityProxy();
+  const initialize = proxy.handleClient({
+    jsonrpc: '2.0',
+    id: 'initialize',
+    method: 'initialize',
+    params: {
+      protocolVersion: 1,
+      clientCapabilities: {
+        plan: {},
+        _meta: { existingCapability: true, 'x.ai/userMessageEcho': true },
+      },
+    },
+  }).toRuntime[0];
+
+  assert.equal(initialize.params.protocolVersion, 1);
+  assert.deepEqual(initialize.params.clientCapabilities.plan, {});
+  assert.deepEqual(initialize.params.clientCapabilities._meta, {
+    existingCapability: true,
+    'x.ai/userMessageEcho': false,
+  });
 });
 
 test('settles an initial one-model response with the late complete model snapshot', () => {
@@ -655,10 +705,10 @@ test('safely degrades a legacy Ask interaction selection to Plan across response
     configResponse.result.configOptions.find((option) => option.id === 'plan_mode').currentValue,
     true
   );
-  assert.equal(response.toRuntime[0].method, 'session/set_model');
+  assert.equal(response.toRuntime[0].method, 'session/set_config_option');
 });
 
-test('translates reasoning effort through set_model and preserves the model id', () => {
+test('forwards reasoning effort through the native 1.0.34 config option', () => {
   const { proxy } = readyProxy();
   const request = proxy.handleClient({
     jsonrpc: '2.0',
@@ -673,11 +723,11 @@ test('translates reasoning effort through set_model and preserves the model id',
   assert.deepEqual(request, {
     jsonrpc: '2.0',
     id: 4,
-    method: 'session/set_model',
+    method: 'session/set_config_option',
     params: {
       sessionId: 'grok-session',
-      modelId: 'grok-build',
-      _meta: { reasoningEffort: 'low' },
+      configId: 'reasoning_effort',
+      value: 'low',
     },
   });
   const response = proxy.handleRuntime({ jsonrpc: '2.0', id: 4, result: {} }).toClient[0];
@@ -685,6 +735,264 @@ test('translates reasoning effort through set_model and preserves the model id',
     response.result.configOptions.find((option) => option.id === 'reasoning_effort').currentValue,
     'low'
   );
+});
+
+test('preserves a real reasoning value that is not a selectable option', () => {
+  const responseWithMax = structuredClone(sessionResponse);
+  responseWithMax.result.models.availableModels[0]._meta = {
+    reasoningEffort: 'high',
+    reasoningEfforts: [{ id: 'low' }, { id: 'high' }],
+  };
+  responseWithMax.result.configOptions.find(
+    (option) => option.id === 'reasoning_effort'
+  ).currentValue = 'max';
+  const { proxy, response } = readyProxy(responseWithMax);
+  assert.equal(
+    response.result.configOptions.find((option) => option.id === 'reasoning_effort').currentValue,
+    'max'
+  );
+
+  const refreshed = proxy.handleRuntime({
+    jsonrpc: '2.0',
+    method: '_x.ai/models/update',
+    params: {
+      currentModelId: 'grok-build',
+      availableModels: structuredClone(responseWithMax.result.models.availableModels),
+    },
+  }).toClient[0];
+  assert.equal(
+    refreshed.params.update.configOptions.find((option) => option.id === 'reasoning_effort')
+      .currentValue,
+    'max'
+  );
+
+  const runtimeOptions = structuredClone(sessionResponse.result.configOptions);
+  runtimeOptions.find((option) => option.id === 'reasoning_effort').currentValue = 'none';
+  const update = proxy.handleRuntime({
+    jsonrpc: '2.0',
+    method: 'session/update',
+    params: {
+      sessionId: 'grok-session',
+      update: { sessionUpdate: 'config_option_update', configOptions: runtimeOptions },
+    },
+  }).toClient[0];
+  assert.equal(
+    update.params.update.configOptions.find((option) => option.id === 'reasoning_effort')
+      .currentValue,
+    'none'
+  );
+
+  const rejected = proxy.handleClient({
+    jsonrpc: '2.0',
+    id: 40,
+    method: 'session/set_config_option',
+    params: { sessionId: 'grok-session', configId: 'reasoning_effort', value: 'none' },
+  });
+  assert.deepEqual(rejected.toRuntime, []);
+  assert.match(rejected.toClient[0].error.message, /Unsupported Grok reasoning effort/);
+});
+
+test('preserves native config errors without applying optimistic state', () => {
+  const { proxy } = readyProxy();
+  const request = proxy.handleClient({
+    jsonrpc: '2.0',
+    id: 38,
+    method: 'session/set_config_option',
+    params: { sessionId: 'grok-session', configId: 'model', value: 'unknown-model' },
+  }).toRuntime[0];
+  assert.equal(request.method, 'session/set_config_option');
+
+  const error = {
+    jsonrpc: '2.0',
+    id: 38,
+    error: { code: -32602, message: 'unknown model' },
+  };
+  assert.deepEqual(proxy.handleRuntime(error).toClient, [error]);
+
+  const reasoning = proxy.handleClient({
+    jsonrpc: '2.0',
+    id: 39,
+    method: 'session/set_config_option',
+    params: { sessionId: 'grok-session', configId: 'reasoning_effort', value: 'high' },
+  });
+  assert.equal(reasoning.toClient.length, 0);
+  assert.equal(reasoning.toRuntime[0].method, 'session/set_config_option');
+});
+
+test('merges native config updates with Lody controls and passes future options through', () => {
+  const { proxy } = readyProxy();
+  proxy.handleClient({
+    jsonrpc: '2.0',
+    id: 33,
+    method: 'session/set_config_option',
+    params: {
+      sessionId: 'grok-session',
+      configId: 'permission_mode',
+      value: 'always-approve',
+    },
+  });
+  proxy.handleClient({
+    jsonrpc: '2.0',
+    id: 34,
+    method: 'session/set_config_option',
+    params: { sessionId: 'grok-session', configId: 'plan_mode', value: true },
+  });
+  proxy.handleRuntime({ jsonrpc: '2.0', id: 34, result: {} });
+
+  const memoryOption = {
+    id: 'memory',
+    name: 'Memory',
+    description: 'Retain context across prompts',
+    category: 'other',
+    type: 'boolean',
+    currentValue: true,
+  };
+  const nativeOptions = [...sessionResponse.result.configOptions, memoryOption];
+  const update = proxy.handleRuntime({
+    jsonrpc: '2.0',
+    method: 'session/update',
+    params: {
+      sessionId: 'grok-session',
+      update: { sessionUpdate: 'config_option_update', configOptions: nativeOptions },
+    },
+  });
+  assert.equal(update.toClient.length, 1);
+  const merged = update.toClient[0].params.update.configOptions;
+  assert.deepEqual(
+    merged.map((option) => option.id),
+    ['plan_mode', 'permission_mode', 'model', 'reasoning_effort', 'memory']
+  );
+  assert.equal(merged.find((option) => option.id === 'plan_mode').currentValue, true);
+  assert.equal(
+    merged.find((option) => option.id === 'permission_mode').currentValue,
+    'always-approve'
+  );
+  assert.deepEqual(merged.find((option) => option.id === 'memory'), memoryOption);
+
+  const request = proxy.handleClient({
+    jsonrpc: '2.0',
+    id: 35,
+    method: 'session/set_config_option',
+    params: { sessionId: 'grok-session', configId: 'memory', value: false },
+  }).toRuntime[0];
+  assert.deepEqual(request.params, {
+    sessionId: 'grok-session',
+    configId: 'memory',
+    value: false,
+  });
+  const nativeReplyOptions = nativeOptions.map((option) =>
+    option.id === 'memory' ? { ...option, currentValue: false } : option
+  );
+  const response = proxy.handleRuntime({
+    jsonrpc: '2.0',
+    id: 35,
+    result: { applied: true, configOptions: nativeReplyOptions },
+  }).toClient[0];
+  assert.equal(response.result.applied, true);
+  assert.equal(
+    response.result.configOptions.find((option) => option.id === 'memory').currentValue,
+    false
+  );
+  assert.equal(
+    response.result.configOptions.find((option) => option.id === 'permission_mode').currentValue,
+    'always-approve'
+  );
+});
+
+test('preserves rich reasoning selectors and maps aliases only for the legacy fallback', () => {
+  const richModel = {
+    modelId: 'grok-rich',
+    name: 'Grok Rich',
+    _meta: {
+      reasoningEffort: 'xhigh',
+      reasoningEfforts: [
+        {
+          id: 'deep',
+          value: 'xhigh',
+          label: 'Deep',
+          description: 'Maximum reasoning',
+          default: true,
+        },
+        { id: 'fast', value: 'low', label: 'Fast' },
+      ],
+    },
+  };
+  const nativeResponse = structuredClone(sessionResponse);
+  nativeResponse.result.models = {
+    currentModelId: 'grok-rich',
+    availableModels: [richModel],
+  };
+  nativeResponse.result.configOptions = [
+    {
+      id: 'model',
+      name: 'Model',
+      category: 'model',
+      type: 'select',
+      currentValue: 'grok-rich',
+      options: [{ value: 'grok-rich', name: 'Grok Rich' }],
+    },
+    {
+      id: 'reasoning_effort',
+      name: 'Reasoning Effort',
+      category: 'thought_level',
+      type: 'select',
+      currentValue: 'deep',
+      options: [
+        { value: 'deep', name: 'Deep', description: 'Maximum reasoning' },
+        { value: 'fast', name: 'Fast' },
+      ],
+    },
+  ];
+  const nativeProxy = new GrokAcpCompatibilityProxy();
+  nativeProxy.handleClient({
+    jsonrpc: '2.0',
+    id: 1,
+    method: 'session/new',
+    params: { cwd: '/tmp/project', mcpServers: [], _meta: { clientIdentifier } },
+  });
+  const nativeStartup = nativeProxy.handleRuntime(nativeResponse).toClient[0];
+  const richOption = nativeStartup.result.configOptions.find(
+    (option) => option.id === 'reasoning_effort'
+  );
+  assert.equal(richOption.currentValue, 'deep');
+  assert.deepEqual(richOption.options[0], {
+    value: 'deep',
+    name: 'Deep',
+    description: 'Maximum reasoning',
+  });
+  const nativeRequest = nativeProxy.handleClient({
+    jsonrpc: '2.0',
+    id: 36,
+    method: 'session/set_config_option',
+    params: { sessionId: 'grok-session', configId: 'reasoning_effort', value: 'deep' },
+  }).toRuntime[0];
+  assert.equal(nativeRequest.method, 'session/set_config_option');
+  assert.equal(nativeRequest.params.value, 'deep');
+
+  const legacyResponse = structuredClone(nativeResponse);
+  delete legacyResponse.result.configOptions;
+  legacyResponse.result._meta['x.ai/sessionConfig'].options = [
+    { id: 'grok-rich', category: 'model', label: 'Grok Rich', selected: true },
+    { id: 'deep', category: 'mode', label: 'Deep', selected: true },
+    { id: 'fast', category: 'mode', label: 'Fast', selected: false },
+  ];
+  const legacyProxy = new GrokAcpCompatibilityProxy();
+  legacyProxy.handleClient({
+    jsonrpc: '2.0',
+    id: 1,
+    method: 'session/new',
+    params: { cwd: '/tmp/project', mcpServers: [], _meta: { clientIdentifier } },
+  });
+  legacyProxy.handleRuntime(legacyResponse);
+  const legacyRequest = legacyProxy.handleClient({
+    jsonrpc: '2.0',
+    id: 37,
+    method: 'session/set_config_option',
+    params: { sessionId: 'grok-session', configId: 'reasoning_effort', value: 'deep' },
+  }).toRuntime[0];
+  assert.equal(legacyRequest.method, 'session/set_model');
+  assert.equal(legacyRequest.params.modelId, 'grok-rich');
+  assert.deepEqual(legacyRequest.params._meta, { reasoningEffort: 'xhigh' });
 });
 
 test('requires the Lody clientIdentifier before changing permissions', () => {
@@ -777,7 +1085,7 @@ test('preserves client-scoped permission state for a fresh replacement session',
   );
 });
 
-test('rebuilds, validates, and translates reasoning effort against the selected model', () => {
+test('rebuilds, validates, and forwards reasoning effort against the selected model', () => {
   const { proxy } = readyProxy();
   proxy.handleRuntime(modelSnapshot);
   const modelRequest = proxy.handleClient({
@@ -786,8 +1094,9 @@ test('rebuilds, validates, and translates reasoning effort against the selected 
     method: 'session/set_config_option',
     params: { sessionId: 'grok-session', configId: 'model', value: 'grok-4.5' },
   }).toRuntime[0];
-  assert.equal(modelRequest.method, 'session/set_model');
-  assert.equal(modelRequest.params.modelId, 'grok-4.5');
+  assert.equal(modelRequest.method, 'session/set_config_option');
+  assert.equal(modelRequest.params.configId, 'model');
+  assert.equal(modelRequest.params.value, 'grok-4.5');
   const response = proxy.handleRuntime({ jsonrpc: '2.0', id: modelRequest.id, result: {} })
     .toClient[0];
   const effort = response.result.configOptions.find((option) => option.id === 'reasoning_effort');
@@ -812,13 +1121,57 @@ test('rebuilds, validates, and translates reasoning effort against the selected 
     method: 'session/set_config_option',
     params: { sessionId: 'grok-session', configId: 'reasoning_effort', value: 'medium' },
   }).toRuntime[0];
-  assert.equal(accepted.method, 'session/set_model');
-  assert.equal(accepted.params.modelId, 'grok-4.5');
-  assert.deepEqual(accepted.params._meta, { reasoningEffort: 'medium' });
+  assert.deepEqual(accepted, {
+    jsonrpc: '2.0',
+    id: 43,
+    method: 'session/set_config_option',
+    params: {
+      sessionId: 'grok-session',
+      configId: 'reasoning_effort',
+      value: 'medium',
+    },
+  });
 });
 
-test('tracks the official snake_case model_changed notification', () => {
+test('waits for the complete native config update after a private model_changed precursor', () => {
   const { proxy } = readyProxy();
+  const precursor = proxy.handleRuntime({
+    jsonrpc: '2.0',
+    method: 'x.ai/session_notification',
+    params: {
+      sessionId: 'grok-session',
+      update: {
+        sessionUpdate: 'model_changed',
+        model_id: 'grok-build',
+        reasoning_effort: 'low',
+      },
+    },
+  });
+  assert.equal(precursor.toRuntime[0].method, '_x.ai/session/info');
+  assert.deepEqual(precursor.toClient, []);
+
+  const runtimeOptions = structuredClone(sessionResponse.result.configOptions);
+  runtimeOptions.find((option) => option.id === 'reasoning_effort').currentValue = 'low';
+  const standard = proxy.handleRuntime({
+    jsonrpc: '2.0',
+    method: 'session/update',
+    params: {
+      sessionId: 'grok-session',
+      update: { sessionUpdate: 'config_option_update', configOptions: runtimeOptions },
+    },
+  });
+  assert.equal(standard.toClient.length, 1);
+  assert.equal(standard.toClient[0].params.update.sessionUpdate, 'config_option_update');
+  assert.equal(
+    standard.toClient[0].params.update.configOptions.find(
+      (option) => option.id === 'reasoning_effort'
+    ).currentValue,
+    'low'
+  );
+});
+
+test('translates the official snake_case model_changed notification for legacy sessions', () => {
+  const { proxy } = readyProxy(legacySessionResponse);
   const modelChanged = proxy.handleRuntime({
     jsonrpc: '2.0',
     method: 'x.ai/session_notification',
@@ -850,7 +1203,7 @@ test('tracks the official snake_case model_changed notification', () => {
 });
 
 test('rebuilds the reasoning-effort ladder when the runtime changes the model', () => {
-  const { proxy } = readyProxy();
+  const { proxy } = readyProxy(legacySessionResponse);
   proxy.handleRuntime(modelSnapshot);
   const changed = proxy.handleRuntime({
     jsonrpc: '2.0',

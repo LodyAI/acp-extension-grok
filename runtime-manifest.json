@@ -1,8 +1,8 @@
 {
   "officialRuntime": {
     "package": "@xai-official/grok",
-    "version": "1.0.13",
-    "minimumSupportedVersion": "1.0.13"
+    "version": "1.0.34",
+    "minimumSupportedVersion": "1.0.34"
   },
   "privateWireContract": {
     "permissionNotification": "x.ai/yolo_mode_changed",
@@ -10,6 +10,7 @@
     "sessionNotification": "x.ai/session_notification",
     "sessionUpdateNotification": "x.ai/session/update",
     "modelsUpdateNotification": "x.ai/models/update",
+    "userMessageEchoCapability": "x.ai/userMessageEcho",
     "turnCompletedUpdate": "turn_completed",
     "sessionInfoRequest": "x.ai/session/info",
     "billingRequest": "x.ai/billing",

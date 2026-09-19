@@ -21,8 +21,10 @@
 - Session responses publish the per-model view to Lody as
   `_meta.lody.modelReasoningEfforts`; vendor model `_meta` never reaches Lody
   as a contract.
-- The runtime `model_changed` notification is translated to standard ACP
-  `config_option_update`, never passed through to Lody.
+- For sessions that publish native standard config options, consume the runtime
+  `model_changed` precursor internally and let the following complete
+  `config_option_update` be the single client-visible update. Translate the
+  precursor for legacy sessions only; never pass it through to Lody.
 
 ## Permission modes
 
@@ -34,7 +36,7 @@
 
 ## Model snapshot settling
 
-- Official Grok 1.0.13 may return a provisional model roster from `session/new`, then emit
+- Official Grok 1.0.34 may return a provisional model roster from `session/new`, then emit
   `_x.ai/models/update` later. The update has no session id and is a process-level complete
   snapshot containing `currentModelId` and `availableModels`.
 - The production adapter must settle a pending session response from that explicit snapshot
