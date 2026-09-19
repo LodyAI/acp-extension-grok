@@ -21,8 +21,10 @@
 - Session responses publish the per-model view to Lody as
   `_meta.lody.modelReasoningEfforts`; vendor model `_meta` never reaches Lody
   as a contract.
-- The runtime `model_changed` notification is translated to standard ACP
-  `config_option_update`, never passed through to Lody.
+- For sessions that publish native standard config options, consume the runtime
+  `model_changed` precursor internally and let the following complete
+  `config_option_update` be the single client-visible update. Translate the
+  precursor for legacy sessions only; never pass it through to Lody.
 
 ## Permission modes
 

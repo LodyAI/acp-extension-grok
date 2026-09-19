@@ -57,6 +57,9 @@ const sessionResponse = {
   },
 };
 
+const legacySessionResponse = structuredClone(sessionResponse);
+delete legacySessionResponse.result.configOptions;
+
 const modelSnapshot = {
   jsonrpc: '2.0',
   method: '_x.ai/models/update',
@@ -85,7 +88,7 @@ const modelSnapshot = {
   },
 };
 
-function readyProxy() {
+function readyProxy(runtimeResponse = sessionResponse) {
   const proxy = new GrokAcpCompatibilityProxy();
   proxy.handleClient({
     jsonrpc: '2.0',
@@ -97,7 +100,7 @@ function readyProxy() {
       _meta: { clientIdentifier },
     },
   });
-  const startup = proxy.handleRuntime(sessionResponse);
+  const startup = proxy.handleRuntime(runtimeResponse);
   return { proxy, startup, response: startup.toClient[0] };
 }
 
@@ -734,6 +737,61 @@ test('forwards reasoning effort through the native 1.0.34 config option', () => 
   );
 });
 
+test('preserves a real reasoning value that is not a selectable option', () => {
+  const responseWithMax = structuredClone(sessionResponse);
+  responseWithMax.result.models.availableModels[0]._meta = {
+    reasoningEffort: 'high',
+    reasoningEfforts: [{ id: 'low' }, { id: 'high' }],
+  };
+  responseWithMax.result.configOptions.find(
+    (option) => option.id === 'reasoning_effort'
+  ).currentValue = 'max';
+  const { proxy, response } = readyProxy(responseWithMax);
+  assert.equal(
+    response.result.configOptions.find((option) => option.id === 'reasoning_effort').currentValue,
+    'max'
+  );
+
+  const refreshed = proxy.handleRuntime({
+    jsonrpc: '2.0',
+    method: '_x.ai/models/update',
+    params: {
+      currentModelId: 'grok-build',
+      availableModels: structuredClone(responseWithMax.result.models.availableModels),
+    },
+  }).toClient[0];
+  assert.equal(
+    refreshed.params.update.configOptions.find((option) => option.id === 'reasoning_effort')
+      .currentValue,
+    'max'
+  );
+
+  const runtimeOptions = structuredClone(sessionResponse.result.configOptions);
+  runtimeOptions.find((option) => option.id === 'reasoning_effort').currentValue = 'none';
+  const update = proxy.handleRuntime({
+    jsonrpc: '2.0',
+    method: 'session/update',
+    params: {
+      sessionId: 'grok-session',
+      update: { sessionUpdate: 'config_option_update', configOptions: runtimeOptions },
+    },
+  }).toClient[0];
+  assert.equal(
+    update.params.update.configOptions.find((option) => option.id === 'reasoning_effort')
+      .currentValue,
+    'none'
+  );
+
+  const rejected = proxy.handleClient({
+    jsonrpc: '2.0',
+    id: 40,
+    method: 'session/set_config_option',
+    params: { sessionId: 'grok-session', configId: 'reasoning_effort', value: 'none' },
+  });
+  assert.deepEqual(rejected.toRuntime, []);
+  assert.match(rejected.toClient[0].error.message, /Unsupported Grok reasoning effort/);
+});
+
 test('preserves native config errors without applying optimistic state', () => {
   const { proxy } = readyProxy();
   const request = proxy.handleClient({
@@ -1075,8 +1133,45 @@ test('rebuilds, validates, and forwards reasoning effort against the selected mo
   });
 });
 
-test('tracks the official snake_case model_changed notification', () => {
+test('waits for the complete native config update after a private model_changed precursor', () => {
   const { proxy } = readyProxy();
+  const precursor = proxy.handleRuntime({
+    jsonrpc: '2.0',
+    method: 'x.ai/session_notification',
+    params: {
+      sessionId: 'grok-session',
+      update: {
+        sessionUpdate: 'model_changed',
+        model_id: 'grok-build',
+        reasoning_effort: 'low',
+      },
+    },
+  });
+  assert.equal(precursor.toRuntime[0].method, '_x.ai/session/info');
+  assert.deepEqual(precursor.toClient, []);
+
+  const runtimeOptions = structuredClone(sessionResponse.result.configOptions);
+  runtimeOptions.find((option) => option.id === 'reasoning_effort').currentValue = 'low';
+  const standard = proxy.handleRuntime({
+    jsonrpc: '2.0',
+    method: 'session/update',
+    params: {
+      sessionId: 'grok-session',
+      update: { sessionUpdate: 'config_option_update', configOptions: runtimeOptions },
+    },
+  });
+  assert.equal(standard.toClient.length, 1);
+  assert.equal(standard.toClient[0].params.update.sessionUpdate, 'config_option_update');
+  assert.equal(
+    standard.toClient[0].params.update.configOptions.find(
+      (option) => option.id === 'reasoning_effort'
+    ).currentValue,
+    'low'
+  );
+});
+
+test('translates the official snake_case model_changed notification for legacy sessions', () => {
+  const { proxy } = readyProxy(legacySessionResponse);
   const modelChanged = proxy.handleRuntime({
     jsonrpc: '2.0',
     method: 'x.ai/session_notification',
@@ -1108,7 +1203,7 @@ test('tracks the official snake_case model_changed notification', () => {
 });
 
 test('rebuilds the reasoning-effort ladder when the runtime changes the model', () => {
-  const { proxy } = readyProxy();
+  const { proxy } = readyProxy(legacySessionResponse);
   proxy.handleRuntime(modelSnapshot);
   const changed = proxy.handleRuntime({
     jsonrpc: '2.0',

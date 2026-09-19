@@ -24,7 +24,10 @@ Supported configuration:
   `session/set_config_option` contract. The adapter merges the runtime's
   `configOptions` and `config_option_update` snapshots with Lody's Plan and
   Permission controls. A legacy `session/set_model` fallback remains for older
-  runtimes that do not publish the standard options.
+  runtimes that do not publish the standard options. On the native path, the
+  private `model_changed` precursor updates adapter state without producing a
+  duplicate client update; legacy sessions still receive its standard ACP
+  translation.
 - Interaction mode maps to the corresponding standard legacy ACP call.
   Grok 1.0.34 reliably supports Agent and Plan. It silently ignores Ask, so the
   adapter does not advertise Ask and maps legacy persisted Ask selections to

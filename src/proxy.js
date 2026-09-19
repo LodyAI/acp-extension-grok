@@ -473,16 +473,20 @@ export class GrokAcpCompatibilityProxy {
     }
     state.reasoningOptions = reasoningOptions;
     state.reasoningEfforts = reasoningEfforts;
-    const reportedSelector = reasoningSelector(reasoningOptions, reportedReasoningEffort);
-    const metadataSelector = reasoningSelector(reasoningOptions, metadataReasoningEffort);
+    const reportedValue =
+      reasoningSelector(reasoningOptions, reportedReasoningEffort) ??
+      (typeof reportedReasoningEffort === 'string' ? reportedReasoningEffort : undefined);
+    const metadataValue =
+      reasoningSelector(reasoningOptions, metadataReasoningEffort) ??
+      (typeof metadataReasoningEffort === 'string' ? metadataReasoningEffort : undefined);
     state.reasoningEffort =
-      reportedSelector !== undefined
-        ? reportedSelector
-        : previousModelId === currentModelId && reasoningEfforts.includes(state.reasoningEffort)
+      reportedValue !== undefined
+        ? reportedValue
+        : previousModelId === currentModelId && typeof state.reasoningEffort === 'string'
           ? state.reasoningEffort
-          : metadataSelector !== undefined
-            ? metadataSelector
-            : (reasoningOptions.find((option) => option.default)?.id ?? reasoningEfforts[0]);
+          : (metadataValue ??
+            reasoningOptions.find((option) => option.default)?.id ??
+            reasoningEfforts[0]);
   }
 
   applyRuntimeConfigOptions(state, options) {
@@ -530,7 +534,14 @@ export class GrokAcpCompatibilityProxy {
       state.reasoningEfforts = state.reasoningOptions.map((option) => option.id);
     }
     const selected = reasoningSelector(state.reasoningOptions, reasoningOption.currentValue);
-    if (selected !== undefined) state.reasoningEffort = selected;
+    if (selected !== undefined) {
+      state.reasoningEffort = selected;
+    } else if (typeof reasoningOption.currentValue === 'string') {
+      // Grok deliberately reports real values such as `none` or `max` even
+      // when they are not selectable. Preserve that authoritative state while
+      // continuing to validate client selections against the published menu.
+      state.reasoningEffort = reasoningOption.currentValue;
+    }
   }
 
   applyModelSnapshot(state, snapshot) {
@@ -1080,8 +1091,20 @@ export class GrokAcpCompatibilityProxy {
       if (typeof modelId === 'string') {
         this.applyCurrentModel(state, modelId, reasoningEffort);
       }
+      const publishesStandardConfig =
+        configOption(state.runtimeConfigOptions, 'model') !== undefined ||
+        configOption(state.runtimeConfigOptions, 'reasoning_effort') !== undefined;
+      if (publishesStandardConfig) {
+        // Grok 1.0.34 emits a complete standard config_option_update directly
+        // after this private precursor. Keep the internal state current, but
+        // let that authoritative snapshot be the single client-visible update.
+        return {
+          toRuntime: [this.internalRequest('context', sessionId)],
+          toClient: [],
+        };
+      }
       // The vendor notification is not standard ACP and Lody ignores it, so
-      // the state change reaches the client as a standard config update.
+      // legacy sessions receive the state change as a standard config update.
       return {
         toRuntime: [this.internalRequest('context', sessionId)],
         toClient: [
@@ -1158,6 +1181,7 @@ export class GrokAcpCompatibilityProxy {
       reasoningEfforts: reasoningOptions.map((option) => option.id),
       reasoningEffort:
         reasoningSelector(reasoningOptions, reportedReasoningEffort) ??
+        (typeof reportedReasoningEffort === 'string' ? reportedReasoningEffort : undefined) ??
         old?.reasoningEffort ??
         reasoningOptions.find((option) => option.default)?.id ??
         reasoningOptions[0]?.id,
