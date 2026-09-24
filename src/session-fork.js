@@ -13,11 +13,9 @@ function targetIndex(meta) {
   if (fork === undefined) return undefined;
   if (fork?.version !== 1) throw new Error('Unsupported forkAtTurn version');
   if (fork.turnId === undefined) return undefined;
-  if (typeof fork.turnId !== 'string' || !/^grok-prompt:(0|[1-9][0-9]*)$/.test(fork.turnId)) {
-    throw new Error('Invalid Grok fork turn id');
-  }
-  const index = Number(fork.turnId.slice(TURN_PREFIX.length));
-  if (!Number.isSafeInteger(index)) throw new Error('Invalid Grok fork turn index');
+  const index =
+    typeof fork.turnId === 'string' ? Number(fork.turnId.slice(TURN_PREFIX.length)) : NaN;
+  if (grokTurnId(index) !== fork.turnId) throw new Error('Invalid Grok fork turn id');
   return index;
 }
 
@@ -88,7 +86,7 @@ export class GrokSessionForkBridge {
     const operation = pending.operation;
     const id = operation.message.id;
     if (message.error) return { toRuntime: [], toClient: [{ ...message, id }] };
-    const result = message.result?.result ?? message.result;
+    const result = message.result;
     if (pending.kind === 'fork-list') {
       if (!Array.isArray(result?.sessions))
         return forkError(id, 'Invalid Grok session list', -32603);
@@ -111,14 +109,11 @@ export class GrokSessionForkBridge {
     }
     // Resume attaches without replaying history: Lody already copied the visible
     // source prefix. Do not touch/cancel/reload the source session.
-    return resume(
-      {
-        ...operation.message,
-        method: 'session/resume',
-        params: { ...operation.message.params, sessionId: child },
-      },
-      child
-    );
+    return resume({
+      ...operation.message,
+      method: 'session/resume',
+      params: { ...operation.message.params, sessionId: child },
+    });
   }
 
   update(message) {

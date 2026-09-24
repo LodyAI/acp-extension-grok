@@ -2154,6 +2154,10 @@ test('rejects invalid target metadata before any native copy and missing sources
     'grok-prompt:-1',
     'grok-prompt:01',
     'grok-prompt:1.5',
+    'grok-prompt:1e2',
+    'grok-prompt: 0',
+    'grok-prompt:-0',
+    'other-token:0',
     'grok-prompt:9007199254740992',
     null,
   ]) {
@@ -2174,7 +2178,12 @@ test('rejects invalid target metadata before any native copy and missing sources
 });
 
 test('malformed native results and reused parent identities fail closed', () => {
-  for (const copyResult of [{}, { newSessionId: '' }, { newSessionId: 'parent' }]) {
+  for (const copyResult of [
+    {},
+    { newSessionId: '' },
+    { newSessionId: 'parent' },
+    { result: { newSessionId: 'child' } },
+  ]) {
     const proxy = new GrokAcpCompatibilityProxy();
     let output = proxy.handleClient(forkRequest());
     output = reply(proxy, output.toRuntime[0], {

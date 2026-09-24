@@ -452,12 +452,9 @@ export class GrokAcpCompatibilityProxy {
     // so the selection outlives any single session and is stored by client.
     this.permissionModes = new Map();
     this.nextInternalRequestId = Number.MAX_SAFE_INTEGER;
-    this.forks = new GrokSessionForkBridge((kind, operation, method, params) => {
-      while (this.pending.has(this.nextInternalRequestId)) this.nextInternalRequestId -= 1;
-      const id = this.nextInternalRequestId--;
-      this.pending.set(id, { kind, operation });
-      return { jsonrpc: '2.0', id, method, params };
-    });
+    this.forks = new GrokSessionForkBridge((kind, operation, method, params) =>
+      this.runtimeRequest({ kind, operation }, method, params)
+    );
   }
 
   applyCurrentModel(state, currentModelId, reportedReasoningEffort) {
@@ -653,18 +650,20 @@ export class GrokAcpCompatibilityProxy {
     };
   }
 
-  internalRequest(kind, sessionId, responseId) {
+  runtimeRequest(pending, method, params) {
     while (this.pending.has(this.nextInternalRequestId)) this.nextInternalRequestId -= 1;
-    const id = this.nextInternalRequestId;
-    this.nextInternalRequestId -= 1;
-    this.pending.set(id, { kind, sessionId, responseId });
+    const id = this.nextInternalRequestId--;
+    this.pending.set(id, pending);
+    return { jsonrpc: '2.0', id, method, params };
+  }
+
+  internalRequest(kind, sessionId, responseId) {
     const { contractKey, params } = INTERNAL_REQUESTS[kind];
-    return {
-      jsonrpc: '2.0',
-      id,
-      method: wireExtensionMethod(contract[contractKey]),
-      params: params(sessionId),
-    };
+    return this.runtimeRequest(
+      { kind, sessionId, responseId },
+      wireExtensionMethod(contract[contractKey]),
+      params(sessionId)
+    );
   }
 
   usageRefreshRequests(sessionId) {
@@ -867,9 +866,9 @@ export class GrokAcpCompatibilityProxy {
     this.pending.delete(message.id);
 
     if (pending.kind === 'fork-list' || pending.kind === 'fork-copy') {
-      return this.forks.response(message, pending, (request, child) => {
+      return this.forks.response(message, pending, (request) => {
         const output = this.handleClient(request);
-        this.pending.get(request.id).forkSessionId = child;
+        this.pending.get(request.id).forkSessionId = request.params.sessionId;
         return output;
       });
     }
