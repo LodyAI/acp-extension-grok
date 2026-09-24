@@ -165,7 +165,7 @@ test('adapts the official runtime wire contract', () => {
   );
 });
 
-test('disables native user-message echo without dropping client capabilities', () => {
+test('requests native turn boundaries without dropping client capabilities', () => {
   const proxy = new GrokAcpCompatibilityProxy();
   const initialize = proxy.handleClient({
     jsonrpc: '2.0',
@@ -184,7 +184,7 @@ test('disables native user-message echo without dropping client capabilities', (
   assert.deepEqual(initialize.params.clientCapabilities.plan, {});
   assert.deepEqual(initialize.params.clientCapabilities._meta, {
     existingCapability: true,
-    'x.ai/userMessageEcho': false,
+    'x.ai/userMessageEcho': true,
   });
 });
 
@@ -396,7 +396,7 @@ test('applies initial always-approve before forwarding session/new', () => {
 });
 
 test('applies initial always-approve to restored sessions', () => {
-  for (const method of ['session/load', 'session/resume', 'session/fork']) {
+  for (const method of ['session/load', 'session/resume']) {
     const proxy = new GrokAcpCompatibilityProxy();
     const output = proxy.handleClient({
       jsonrpc: '2.0',
@@ -552,7 +552,7 @@ test('YOLO selects AllowAlways when it is the only allow kind', () => {
 });
 
 test('startup YOLO enables the fallback without a live config setter', () => {
-  for (const method of ['session/new', 'session/load', 'session/resume', 'session/fork']) {
+  for (const method of ['session/new', 'session/load', 'session/resume']) {
     const proxy = new GrokAcpCompatibilityProxy();
     proxy.handleClient({
       jsonrpc: '2.0',
@@ -865,7 +865,10 @@ test('merges native config updates with Lody controls and passes future options 
     merged.find((option) => option.id === 'permission_mode').currentValue,
     'always-approve'
   );
-  assert.deepEqual(merged.find((option) => option.id === 'memory'), memoryOption);
+  assert.deepEqual(
+    merged.find((option) => option.id === 'memory'),
+    memoryOption
+  );
 
   const request = proxy.handleClient({
     jsonrpc: '2.0',
@@ -1988,4 +1991,263 @@ test('leaves non-title session info and empty titles untouched', () => {
     } };
     assert.deepEqual(proxy.handleRuntime(message).toClient, [message]);
   }
+});
+function forkRequest(turnId, id = 'fork') {
+  return {
+    jsonrpc: '2.0',
+    id,
+    method: 'session/fork',
+    params: {
+      sessionId: 'parent',
+      cwd: '/child',
+      mcpServers: [{ name: 'test', command: 'synthetic', args: [] }],
+      _meta: {
+        clientIdentifier,
+        lody: {
+          sessionConfig: { version: 1, configOptionValues: { permission_mode: 'always-approve' } },
+          ...(turnId === undefined ? {} : { forkAtTurn: { version: 1, turnId } }),
+        },
+      },
+    },
+  };
+}
+
+function reply(proxy, request, result) {
+  return proxy.handleRuntime({ jsonrpc: '2.0', id: request.id, result });
+}
+
+function nativeTurn(sessionId, index, { replay = false, kind = 'user_message_chunk' } = {}) {
+  return {
+    jsonrpc: '2.0',
+    method: 'session/update',
+    params: {
+      sessionId,
+      _meta: { isReplay: replay, promptId: `prompt-${index}` },
+      update: {
+        sessionUpdate: kind,
+        content: { type: 'text', text: 'synthetic' },
+        _meta: { promptIndex: index, vendorField: 'kept' },
+      },
+    },
+  };
+}
+
+test('fork capabilities preserve native capabilities and publish Core v1', () => {
+  const proxy = new GrokAcpCompatibilityProxy();
+  proxy.handleClient({ id: 'init', method: 'initialize', params: {} });
+  const result = reply(
+    proxy,
+    { id: 'init' },
+    {
+      agentCapabilities: {
+        loadSession: true,
+        sessionCapabilities: { resume: {}, list: {} },
+        _meta: { vendor: true },
+      },
+    }
+  ).toClient[0].result;
+  assert.deepEqual(result.agentCapabilities.sessionCapabilities, {
+    resume: {},
+    list: {},
+    fork: {},
+  });
+  assert.deepEqual(result.agentCapabilities._meta.lody.forkAtTurn, { version: 1 });
+  assert.equal(result.agentCapabilities._meta.vendor, true);
+});
+
+test('full fork discovers source cwd across pages, attaches child without replay, and seeds permissions', () => {
+  const proxy = new GrokAcpCompatibilityProxy();
+  const request = forkRequest();
+  let output = proxy.handleClient(request);
+  assert.equal(output.toRuntime[0].method, 'session/list');
+  assert.deepEqual(output.toRuntime[0].params, {});
+  output = reply(proxy, output.toRuntime[0], { sessions: [], nextCursor: 'page-2' });
+  assert.deepEqual(output.toRuntime[0].params, { cursor: 'page-2' });
+  output = reply(proxy, output.toRuntime[0], {
+    sessions: [{ sessionId: 'parent', cwd: '/source' }],
+  });
+  assert.deepEqual(output.toRuntime[0].params, {
+    sourceSessionId: 'parent',
+    sourceCwd: '/source',
+    newCwd: '/child',
+  });
+  assert.equal(output.toRuntime[0].method, '_x.ai/session/fork');
+  assert.deepEqual(output.toClient, []);
+  output = reply(proxy, output.toRuntime[0], { newSessionId: 'child' });
+  const resume = output.toRuntime[0];
+  assert.equal(resume.method, 'session/resume');
+  assert.equal(resume.params.sessionId, 'child');
+  assert.equal(resume.params.cwd, '/child');
+  assert.deepEqual(resume.params.mcpServers, request.params.mcpServers);
+  assert.equal(resume.params._meta.yoloMode, true);
+  assert.equal(resume.params._meta.autoMode, false);
+  const loaded = structuredClone(sessionResponse.result);
+  delete loaded.sessionId;
+  output = reply(proxy, resume, loaded);
+  assert.equal(output.toClient[0].id, 'fork');
+  assert.equal(output.toClient[0].result.sessionId, 'child');
+  assert.equal(
+    output.toClient[0].result.configOptions.find((o) => o.id === 'permission_mode').currentValue,
+    'always-approve'
+  );
+  assert.equal(proxy.sessions.has('parent'), false);
+  const permission = permissionRequest();
+  permission.params.sessionId = 'child';
+  assertAutomatic(proxy.handleRuntime(permission), 'single-use');
+});
+
+test('live and replay turn boundaries use restart-stable Core ids without duplicating live user text', () => {
+  const proxy = new GrokAcpCompatibilityProxy();
+  const boundary = proxy.handleRuntime(nativeTurn('parent', 0)).toClient[0];
+  assert.equal(boundary.params.update.sessionUpdate, 'session_info_update');
+  assert.equal(boundary.params.update.content, undefined);
+  assert.equal(boundary.params.update._meta.lody.turnId, 'grok-prompt:0');
+  const assistant = proxy.handleRuntime(nativeTurn('parent', 0, { kind: 'agent_message_chunk' }))
+    .toClient[0];
+  assert.equal(assistant.params.update._meta.lody.turnId, 'grok-prompt:0');
+  assert.equal(assistant.params.update._meta.vendorField, 'kept');
+  const replay = proxy.handleRuntime(nativeTurn('parent', 2, { replay: true })).toClient[0];
+  assert.equal(replay.params.update.sessionUpdate, 'user_message_chunk');
+  assert.equal(replay.params.update._meta.lody.turnId, 'grok-prompt:2');
+  assert.equal(
+    proxy.handleRuntime(nativeTurn('other', 9, { kind: 'agent_message_chunk' })).toClient[0].params
+      .update._meta.lody,
+    undefined
+  );
+  const restarted = new GrokAcpCompatibilityProxy();
+  let output = restarted.handleClient(forkRequest(assistant.params.update._meta.lody.turnId));
+  output = reply(restarted, output.toRuntime[0], {
+    sessions: [{ sessionId: 'parent', cwd: '/source' }],
+  });
+  assert.equal(output.toRuntime[0].params.targetPromptIndex, 0);
+});
+
+test('fork failures retain the original request id and never fall back to a fresh session', () => {
+  for (const stage of ['list', 'copy', 'resume']) {
+    const proxy = new GrokAcpCompatibilityProxy();
+    let output = proxy.handleClient(forkRequest('grok-prompt:1'));
+    if (stage !== 'list')
+      output = reply(proxy, output.toRuntime[0], {
+        sessions: [{ sessionId: 'parent', cwd: '/source' }],
+      });
+    if (stage === 'resume') output = reply(proxy, output.toRuntime[0], { newSessionId: 'child' });
+    const error = { code: -32001, message: `synthetic ${stage} failure` };
+    output = proxy.handleRuntime({ jsonrpc: '2.0', id: output.toRuntime[0].id, error });
+    assert.deepEqual(output, {
+      toRuntime: [],
+      toClient: [
+        {
+          jsonrpc: '2.0',
+          id: 'fork',
+          error: stage === 'resume' ? { ...error, data: { forkedSessionId: 'child' } } : error,
+        },
+      ],
+    });
+    assert.equal(proxy.sessions.size, 0);
+  }
+});
+
+test('rejects invalid target metadata before any native copy and missing sources after discovery', () => {
+  for (const turnId of [
+    '',
+    'unknown',
+    'grok-prompt:-1',
+    'grok-prompt:01',
+    'grok-prompt:1.5',
+    'grok-prompt:1e2',
+    'grok-prompt: 0',
+    'grok-prompt:-0',
+    'other-token:0',
+    'grok-prompt:9007199254740992',
+    null,
+  ]) {
+    const proxy = new GrokAcpCompatibilityProxy();
+    const output = proxy.handleClient(forkRequest(turnId));
+    assert.deepEqual(output.toRuntime, []);
+    assert.equal(output.toClient[0].error.code, -32602);
+  }
+  const proxy = new GrokAcpCompatibilityProxy();
+  const request = forkRequest('grok-prompt:0');
+  request.params._meta.lody.forkAtTurn.version = 2;
+  assert.equal(proxy.handleClient(request).toClient[0].error.code, -32602);
+  let output = proxy.handleClient(forkRequest());
+  output = reply(proxy, output.toRuntime[0], { sessions: [], nextCursor: 'repeat' });
+  output = reply(proxy, output.toRuntime[0], { sessions: [], nextCursor: 'repeat' });
+  assert.equal(output.toRuntime.length, 0);
+  assert.match(output.toClient[0].error.message, /not found/);
+});
+
+test('malformed native results and reused parent identities fail closed', () => {
+  for (const copyResult of [
+    {},
+    { newSessionId: '' },
+    { newSessionId: 'parent' },
+    { result: { newSessionId: 'child' } },
+  ]) {
+    const proxy = new GrokAcpCompatibilityProxy();
+    let output = proxy.handleClient(forkRequest());
+    output = reply(proxy, output.toRuntime[0], {
+      sessions: [{ sessionId: 'parent', cwd: '/source' }],
+    });
+    output = reply(proxy, output.toRuntime[0], copyResult);
+    assert.equal(output.toRuntime.length, 0);
+    assert.equal(output.toClient[0].error.code, -32603);
+  }
+});
+
+test('fork response waits for the model snapshot with the child identity intact', () => {
+  const proxy = new GrokAcpCompatibilityProxy({ deferSessionResponseUntilModelSnapshot: true });
+  let output = proxy.handleClient(forkRequest());
+  output = reply(proxy, output.toRuntime[0], {
+    sessions: [{ sessionId: 'parent', cwd: '/source' }],
+  });
+  output = reply(proxy, output.toRuntime[0], { newSessionId: 'child' });
+  output = reply(proxy, output.toRuntime[0], { models: sessionResponse.result.models });
+  assert.deepEqual(output.deferredSessionResponseIds, ['fork']);
+  assert.deepEqual(output.toClient, []);
+  output = proxy.handleRuntime(modelSnapshot);
+  const response = output.toClient.find((m) => m.id === 'fork');
+  assert.equal(response.result.sessionId, 'child');
+  assert.equal(response.result.models.currentModelId, 'grok-4.6');
+});
+
+test('concurrent fork requests and reverse requests keep their separate identities', () => {
+  const proxy = new GrokAcpCompatibilityProxy();
+  const a = proxy.handleClient(forkRequest('grok-prompt:0', 'a')).toRuntime[0];
+  const b = proxy.handleClient(forkRequest('grok-prompt:2', 'b')).toRuntime[0];
+  const reverse = {
+    jsonrpc: '2.0',
+    id: a.id,
+    method: 'session/request_permission',
+    params: { sessionId: 'unknown', options: [] },
+  };
+  assert.deepEqual(proxy.handleRuntime(reverse).toClient, [reverse]);
+  for (const [request, target, id] of [
+    [b, 2, 'b'],
+    [a, 0, 'a'],
+  ]) {
+    let output = reply(proxy, request, { sessions: [{ sessionId: 'parent', cwd: '/source' }] });
+    assert.equal(output.toRuntime[0].params.targetPromptIndex, target);
+    output = reply(proxy, output.toRuntime[0], { newSessionId: `child-${id}` });
+    output = reply(proxy, output.toRuntime[0], {});
+    assert.equal(output.toClient[0].id, id);
+    assert.equal(output.toClient[0].result.sessionId, `child-${id}`);
+  }
+});
+
+test('a new prompt never inherits an earlier turn id before its own native boundary', () => {
+  const proxy = new GrokAcpCompatibilityProxy();
+  proxy.handleRuntime(nativeTurn('parent', 4));
+  proxy.handleClient({
+    id: 'prompt',
+    method: 'session/prompt',
+    params: { sessionId: 'parent', prompt: [] },
+  });
+  let output = proxy.handleRuntime(nativeTurn('parent', 5, { kind: 'agent_thought_chunk' }));
+  assert.equal(output.toClient[0].params.update._meta.lody, undefined);
+  proxy.handleRuntime(nativeTurn('parent', 5));
+  const phantom = nativeTurn('parent', undefined);
+  assert.deepEqual(proxy.handleRuntime(phantom).toClient, []);
+  output = proxy.handleRuntime(nativeTurn('parent', 5, { kind: 'tool_call' }));
+  assert.equal(output.toClient[0].params.update._meta.lody.turnId, 'grok-prompt:5');
 });
