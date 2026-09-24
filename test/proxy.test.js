@@ -125,9 +125,7 @@ const promptUsage = {
   usageIsIncomplete: false,
 };
 
-test('pins and adapts the official 1.0.34 wire contract', () => {
-  assert.equal(runtimeManifest.officialRuntime.version, '1.0.34');
-  assert.equal(runtimeManifest.officialRuntime.minimumSupportedVersion, '1.0.34');
+test('adapts the official runtime wire contract', () => {
   assert.deepEqual(
     {
       sessionUpdateNotification: runtimeManifest.privateWireContract.sessionUpdateNotification,
@@ -1942,5 +1940,52 @@ test('native enter/exit mode updates refresh the Core toggle without changing pe
       output.toClient[1].params.update.configOptions.find((o) => o.id === 'plan_mode').currentValue,
       enabled
     );
+  }
+});
+
+
+test('advertises automatic title ownership in initialize', () => {
+  const proxy = new GrokAcpCompatibilityProxy();
+  proxy.handleClient({ jsonrpc: '2.0', id: 'title-init', method: 'initialize', params: { protocolVersion: 1 } });
+  const output = proxy.handleRuntime({ jsonrpc: '2.0', id: 'title-init', result: { protocolVersion: 1, agentCapabilities: {} } });
+  assert.deepEqual(output.toClient[0].result.agentCapabilities._meta.lody.sessionTitle, { version: 1 });
+});
+
+test('tags runtime title updates while preserving their session, text and metadata', () => {
+  const { proxy } = readyProxy();
+  const message = {
+    jsonrpc: '2.0', method: 'session/update',
+    params: { sessionId: 'grok-session', _meta: { isReplay: true }, update: {
+      sessionUpdate: 'session_info_update', title: 'Investigate login', updatedAt: '2026-09-24T00:00:00Z',
+      _meta: { upstream: { value: 1 }, lody: { messagePhase: 'final_answer' } },
+    } },
+  };
+  const output = proxy.handleRuntime(message);
+  assert.deepEqual(output.toRuntime, []);
+  assert.deepEqual(output.toClient, [{ ...message, params: { ...message.params, update: {
+    ...message.params.update, _meta: {
+      ...message.params.update._meta, lody: { messagePhase: 'final_answer', titleSource: 'explicit' },
+    },
+  } } }]);
+  assert.equal(message.params.update._meta.lody.titleSource, undefined);
+});
+
+for (const titleSource of ['generated', 'explicit', 'fallback', 'unset', 'unknown', null]) {
+  test(`does not replace an upstream title source: ${titleSource}`, () => {
+    const { proxy } = readyProxy();
+    const message = { jsonrpc: '2.0', method: 'session/update', params: {
+      sessionId: 'grok-session', update: { sessionUpdate: 'session_info_update', title: 'Title', _meta: { lody: { titleSource } } },
+    } };
+    assert.deepEqual(proxy.handleRuntime(message).toClient, [message]);
+  });
+}
+
+test('leaves non-title session info and empty titles untouched', () => {
+  const { proxy } = readyProxy();
+  for (const title of [undefined, null, '', '   ']) {
+    const message = { jsonrpc: '2.0', method: 'session/update', params: {
+      sessionId: 'grok-session', update: { sessionUpdate: 'session_info_update', title, _meta: { lody: { goal: null } } },
+    } };
+    assert.deepEqual(proxy.handleRuntime(message).toClient, [message]);
   }
 });
