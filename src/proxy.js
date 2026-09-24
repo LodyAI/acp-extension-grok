@@ -1,3 +1,4 @@
+import { GrokSessionForkBridge } from './session-fork.js';
 import { GrokPlanReviewBridge } from './plan-review.js';
 import runtimeManifest from '../runtime-manifest.json' with { type: 'json' };
 import {
@@ -35,6 +36,7 @@ const USD_TICKS_PER_USD = 10_000_000_000;
 const MAX_TRACKED_PROMPTS = 256;
 const GROK_LODY_CAPABILITIES = {
   sessionTitle: { version: 1 },
+  forkAtTurn: { version: 1 },
   usage: { version: 1 },
   rateLimits: { version: 1, query: true },
 };
@@ -304,8 +306,10 @@ function reasoningOptionsFromConfig(option) {
 
 function reasoningSelector(options, reportedValue) {
   if (typeof reportedValue !== 'string') return undefined;
-  return options.find((option) => option.id === reportedValue)?.id ??
-    options.find((option) => option.value === reportedValue)?.id;
+  return (
+    options.find((option) => option.id === reportedValue)?.id ??
+    options.find((option) => option.value === reportedValue)?.id
+  );
 }
 
 function standardConfigOptions(result) {
@@ -426,7 +430,7 @@ function translateInitialize(message) {
         ...clientCapabilities,
         _meta: {
           ...(clientCapabilities._meta ?? {}),
-          [contract.userMessageEchoCapability]: false,
+          [contract.userMessageEchoCapability]: true,
         },
       },
     },
@@ -448,6 +452,12 @@ export class GrokAcpCompatibilityProxy {
     // so the selection outlives any single session and is stored by client.
     this.permissionModes = new Map();
     this.nextInternalRequestId = Number.MAX_SAFE_INTEGER;
+    this.forks = new GrokSessionForkBridge((kind, operation, method, params) => {
+      while (this.pending.has(this.nextInternalRequestId)) this.nextInternalRequestId -= 1;
+      const id = this.nextInternalRequestId--;
+      this.pending.set(id, { kind, operation });
+      return { jsonrpc: '2.0', id, method, params };
+    });
   }
 
   applyCurrentModel(state, currentModelId, reportedReasoningEffort) {
@@ -511,10 +521,7 @@ export class GrokAcpCompatibilityProxy {
           return {
             ...(existing ?? {}),
             modelId: option.value,
-            name:
-              typeof option.name === 'string'
-                ? option.name
-                : (existing?.name ?? option.value),
+            name: typeof option.name === 'string' ? option.name : (existing?.name ?? option.value),
             description: option.description ?? existing?.description,
           };
         });
@@ -705,12 +712,13 @@ export class GrokAcpCompatibilityProxy {
         toClient: [],
       };
     }
+    if (message.method === 'session/fork') return this.forks.start(message);
     if (
       message.method === 'session/new' ||
       message.method === 'session/load' ||
-      message.method === 'session/resume' ||
-      message.method === 'session/fork'
+      message.method === 'session/resume'
     ) {
+      this.forks.turnBySession.delete(params.sessionId);
       const clientIdentifier = params._meta?.clientIdentifier;
       const translated = translateSessionStart(message);
       if (translated.permissionMode && typeof clientIdentifier === 'string') {
@@ -730,6 +738,7 @@ export class GrokAcpCompatibilityProxy {
       };
     }
     if (message.method === 'session/prompt') {
+      this.forks.turnBySession.delete(params.sessionId);
       if (message.id !== undefined) {
         this.pending.set(message.id, {
           kind: 'prompt',
@@ -747,10 +756,7 @@ export class GrokAcpCompatibilityProxy {
     const runtimeOption = configOption(state?.runtimeConfigOptions ?? [], configId);
     const expectsBoolean =
       configId === LODY_PLAN_MODE_CONFIG_ID || runtimeOption?.type === 'boolean';
-    if (
-      !state ||
-      (expectsBoolean ? typeof value !== 'boolean' : typeof value !== 'string')
-    ) {
+    if (!state || (expectsBoolean ? typeof value !== 'boolean' : typeof value !== 'string')) {
       return {
         toRuntime: [],
         toClient: [errorResponse(message.id, 'Unknown Grok session or invalid config value')],
@@ -860,6 +866,14 @@ export class GrokAcpCompatibilityProxy {
     if (!pending) return { toRuntime: [], toClient: [message] };
     this.pending.delete(message.id);
 
+    if (pending.kind === 'fork-list' || pending.kind === 'fork-copy') {
+      return this.forks.response(message, pending, (request, child) => {
+        const output = this.handleClient(request);
+        this.pending.get(request.id).forkSessionId = child;
+        return output;
+      });
+    }
+
     if (pending.kind === 'context') {
       if (message.error) return { toRuntime: [], toClient: [] };
       const sessionInfo = unwrapExtensionResult(message.result);
@@ -904,6 +918,7 @@ export class GrokAcpCompatibilityProxy {
               ...result,
               agentCapabilities: {
                 ...agentCapabilities,
+                sessionCapabilities: { ...agentCapabilities.sessionCapabilities, fork: {} },
                 _meta: {
                   ...(agentCapabilities._meta ?? {}),
                   lody: GROK_LODY_CAPABILITIES,
@@ -915,9 +930,26 @@ export class GrokAcpCompatibilityProxy {
       };
     }
 
-    if (message.error) return { toRuntime: [], toClient: [message] };
+    if (message.error) {
+      if (pending.forkSessionId) {
+        message = {
+          ...message,
+          error: {
+            ...message.error,
+            data: {
+              forkedSessionId: pending.forkSessionId,
+              ...(message.error.data === undefined ? {} : { runtimeErrorData: message.error.data }),
+            },
+          },
+        };
+      }
+      return { toRuntime: [], toClient: [message] };
+    }
 
     if (pending.kind === 'session') {
+      if (pending.forkSessionId) {
+        message = { ...message, result: { ...message.result, sessionId: pending.forkSessionId } };
+      }
       const result = message.result ?? {};
       const sessionId = result.sessionId ?? pending.sessionId;
       if (!sessionId) return { toRuntime: [], toClient: [message] };
@@ -984,6 +1016,8 @@ export class GrokAcpCompatibilityProxy {
   }
 
   handleRuntimeMethod(message) {
+    message = this.forks.update(message);
+    if (!message) return { toRuntime: [], toClient: [] };
     const passthrough = { toRuntime: [], toClient: [message] };
     const logicalMethod = logicalExtensionMethod(message.method);
     if (logicalMethod === contract.planApprovalRequest) {

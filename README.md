@@ -32,8 +32,9 @@ Supported configuration:
   Grok 1.0.34 reliably supports Agent and Plan. It silently ignores Ask, so the
   adapter does not advertise Ask and maps legacy persisted Ask selections to
   Plan.
-- Live `user_message_chunk` echo is explicitly disabled through
-  `x.ai/userMessageEcho`; Lody already owns rendering the submitted prompt.
+- Native `user_message_chunk` echo is requested through `x.ai/userMessageEcho`
+  to read fork boundaries, then consumed for live turns; Lody owns rendering the
+  submitted prompt. Replay user messages remain visible.
 - Per-turn token and trusted cost totals from Grok's prompt metadata or durable
   `_x.ai/session/update` `turn_completed` event map to Core's
   `_lody/session/usage_update` extension. Per-prompt model rows are accumulated
@@ -99,3 +100,40 @@ fallback/unset updates are never promoted. Hosts can skip their own title proces
 The wrapper cannot distinguish an untagged runtime fallback from a real name;
 this preserves the existing trust in official Grok title pushes rather than
 claiming new provenance evidence.
+## Session forks
+
+Standard ACP `session/fork` bridges the official runtime's private
+`x.ai/session/fork`, then attaches the new session with `session/resume` (no
+history replay). The adapter discovers the source cwd with paginated
+`session/list`; the requested cwd and MCP servers belong to the child. Initial
+permission metadata is applied when attaching the child. The source is neither
+cancelled nor reloaded. A failed attach returns `error.data.forkedSessionId` for
+the already-persisted child rather than reporting success or creating a blank session.
+
+Core's `_meta.lody.forkAtTurn: { version: 1, turnId }` selects an inclusive native
+prompt boundary. The adapter publishes opaque `grok-prompt:<index>` turn IDs from
+Grok's native `promptIndex` on live/replayed updates. Native user echoes are
+requested internally to obtain these markers; live user text is consumed, while
+`session_info_update` publishes the boundary. Replay keeps its user text. A new
+prompt clears the previous active boundary; unmarked mid-turn echoes do not
+invent a new turn. Missing markers in older histories stay unsupported for
+point-specific forks. IDs are native branch-local coordinates, not global IDs
+across external rewinds. Do not synthesize or alter them in clients.
+
+Omitting `forkAtTurn` copies the persisted conversation in full. A targeted fork
+passes the native zero-based, inclusive `targetPromptIndex`. This delegates
+history and compaction handling to Grok; it does not copy files or rewrite its
+storage in the adapter. Live copies reflect what the runtime has persisted.
+
+Run deterministic protocol tests with `node scripts/test.mjs`. An optional
+native probe uses a temporary `GROK_HOME`, synthetic history, and no login/model
+prompts, verifying source discovery, full/partial copies, different source/child
+cwd values, and unchanged source files:
+
+```sh
+GROK_PATH=/path/to/official/grok node scripts/probe-session-fork.mjs
+```
+
+The probe passes on 1.0.34 and 1.0.40. Authenticated child continuation, concurrent
+live persistence, and cross-compaction targeted forks need further end-to-end
+validation.

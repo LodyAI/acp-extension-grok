@@ -12,6 +12,7 @@
     "modelsUpdateNotification": "x.ai/models/update",
     "userMessageEchoCapability": "x.ai/userMessageEcho",
     "turnCompletedUpdate": "turn_completed",
+    "sessionForkRequest": "x.ai/session/fork",
     "sessionInfoRequest": "x.ai/session/info",
     "billingRequest": "x.ai/billing",
     "weeklyUsagePeriodType": "USAGE_PERIOD_TYPE_WEEKLY",

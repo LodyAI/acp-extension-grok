@@ -69,3 +69,14 @@
 - Do not forward an automatically answered request to the client. Keep questions,
   mode-switch decisions, unknown sessions, and requests without usable allow options interactive.
 - Never consume a pending client request when a reverse request uses the same id.
+
+## Session forks
+
+- Translate Core's standard `session/fork` and versioned `forkAtTurn` only in the
+  adapter. Discover the source cwd; the request cwd belongs to the child.
+- Copy natively, then resume the child without replay. Never cancel or reload the
+  source, silently discard a malformed boundary, or replace failed forks with new
+  blank sessions. A failed attach reports the already-created child identity.
+- Turn IDs come from native prompt markers, remain opaque to the host, and use
+  the runtime's zero-based inclusive boundary. Consume live user echoes while
+  publishing the Core boundary; preserve replay and unrelated metadata.
