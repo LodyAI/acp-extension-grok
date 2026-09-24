@@ -34,6 +34,7 @@ const INTERNAL_REQUESTS = {
 const USD_TICKS_PER_USD = 10_000_000_000;
 const MAX_TRACKED_PROMPTS = 256;
 const GROK_LODY_CAPABILITIES = {
+  sessionTitle: { version: 1 },
   usage: { version: 1 },
   rateLimits: { version: 1, query: true },
 };
@@ -995,6 +996,34 @@ export class GrokAcpCompatibilityProxy {
     const update = message.params?.update;
     const state = this.sessions.get(sessionId);
     if (!state) return passthrough;
+
+    // The official runtime owns these titles but does not distinguish generated
+    // names from manual renames. Match Core's explicit-name semantics; never
+    // upgrade an upstream source tag (especially fallback/unset).
+    if (
+      message.method === 'session/update' &&
+      update?.sessionUpdate === 'session_info_update' &&
+      typeof update.title === 'string' &&
+      update.title.trim() &&
+      !Object.hasOwn(update._meta?.lody ?? {}, 'titleSource')
+    ) {
+      return {
+        toRuntime: [],
+        toClient: [{
+          ...message,
+          params: {
+            ...message.params,
+            update: {
+              ...update,
+              _meta: {
+                ...update._meta,
+                lody: { ...update._meta?.lody, titleSource: 'explicit' },
+              },
+            },
+          },
+        }],
+      };
+    }
 
     // YOLO is also a client-side policy in Grok. Resolve native permission
     // requests here so clients never briefly render an unanswered request.

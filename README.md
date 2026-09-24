@@ -87,3 +87,15 @@ change permission policy when reviewing a plan.
 Hosts must keep `switch_mode` decisions interactive, including when their tool
 permission policy is Always Approve. Release this adapter with that host change;
 ordinary tool auto-approval is not consent to implement a plan.
+
+## Automatic session titles
+
+The adapter advertises Core `agentCapabilities._meta.lody.sessionTitle: { version: 1 }`.
+The official runtime already pushes automatic titles through ACP `session_info_update`.
+The proxy labels nonempty untagged titles `_meta.lody.titleSource: "explicit"`,
+as the runtime does not distinguish generated names from manual names on this wire.
+It preserves existing source tags, other metadata, and the session id; tagged
+fallback/unset updates are never promoted. Hosts can skip their own title process.
+The wrapper cannot distinguish an untagged runtime fallback from a real name;
+this preserves the existing trust in official Grok title pushes rather than
+claiming new provenance evidence.
