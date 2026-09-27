@@ -1,12 +1,15 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+
+import { isLodySubagentEvent } from 'acp-extension-core';
+
+import runtimeManifest from '../runtime-manifest.json' with { type: 'json' };
 import {
   GrokAcpCompatibilityProxy,
   normalizeBillingRateLimits,
   normalizePromptUsage,
   permissionNotification,
 } from '../src/proxy.js';
-import runtimeManifest from '../runtime-manifest.json' with { type: 'json' };
 
 const clientIdentifier = 'lody:session-1';
 const sessionResponse = {
@@ -103,6 +106,155 @@ function readyProxy(runtimeResponse = sessionResponse) {
   const startup = proxy.handleRuntime(runtimeResponse);
   return { proxy, startup, response: startup.toClient[0] };
 }
+
+test('normalizes nested child streams, cumulative tool arguments, progress and fresh attempts only after negotiation', () => {
+  const { proxy } = readyProxy();
+  const vendor = (sessionId, update) => ({
+    jsonrpc: '2.0',
+    method: '_x.ai/session_notification',
+    params: { sessionId, update },
+  });
+  const spawn = vendor('grok-session', {
+    sessionUpdate: 'subagent_spawned',
+    subagent_id: 'child',
+    child_session_id: 'child',
+    parent_session_id: 'grok-session',
+    subagent_type: 'explore',
+    description: 'Inspect',
+    attempt_id: 'one',
+  });
+  assert.deepEqual(proxy.handleRuntime(spawn).toClient, [spawn]);
+  proxy.handleClient({
+    id: 90,
+    method: 'initialize',
+    params: { clientCapabilities: { _meta: { lody: { subagentEvents: { version: 1 } } } } },
+  });
+  const events = [];
+  const send = (message) => {
+    const output = proxy.handleRuntime(message).toClient;
+    events.push(
+      ...output
+        .filter((item) => item.method === '_lody/subagents/event')
+        .map((item) => item.params),
+    );
+    return output;
+  };
+  send(spawn);
+  const first = events[0].runId;
+  send(
+    vendor('child', {
+      sessionUpdate: 'subagent_spawned',
+      subagent_id: 'nested',
+      child_session_id: 'nested',
+      parent_session_id: 'child',
+      description: 'Nested',
+    }),
+  );
+  assert.equal(events.at(-1).snapshot.parentRunId, first);
+  send({
+    method: 'session/update',
+    params: {
+      sessionId: 'child',
+      update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Working' } },
+    },
+  });
+  send(
+    vendor('child', {
+      sessionUpdate: 'tool_call_delta_chunk',
+      tool_call_id: 'tool',
+      tool_index: 0,
+      name: 'read',
+      arguments_delta: '{"path":',
+    }),
+  );
+  send(
+    vendor('child', {
+      sessionUpdate: 'tool_call_delta_chunk',
+      tool_call_id: 'tool',
+      tool_index: 0,
+      arguments_delta: '"a"}',
+    }),
+  );
+  assert.equal(events.at(-1).update.rawInput, '{"path":"a"}');
+  const [permission] = send({
+    id: 12,
+    method: 'session/request_permission',
+    params: { sessionId: 'child', toolCall: { toolCallId: 'tool' }, options: [] },
+  });
+  assert.equal(permission.params.sessionId, 'grok-session');
+  assert.equal(permission.params._meta.lody.subagentRunId, first);
+  send(
+    vendor('grok-session', {
+      sessionUpdate: 'subagent_progress',
+      child_session_id: 'child',
+      attempt_id: 'one',
+      tokens_used: 42,
+      tool_call_count: 2,
+      tools_used: ['read'],
+    }),
+  );
+  assert.deepEqual(events.at(-1).progress, {
+    toolCallCount: 2,
+    contextTokens: 42,
+    toolsUsed: ['read'],
+  });
+  send(
+    vendor('grok-session', {
+      sessionUpdate: 'subagent_finished',
+      child_session_id: 'child',
+      attempt_id: 'one',
+      status: 'completed',
+      output: 'Done',
+      tool_calls: 5,
+      turns: 3,
+    }),
+  );
+  assert.equal(events.at(-1).snapshot.state, 'completed');
+  assert.deepEqual(events.at(-2).progress, { toolCallCount: 5, turnCount: 3 });
+  assert.deepEqual(
+    send({
+      method: 'session/update',
+      params: {
+        sessionId: 'child',
+        update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'late' } },
+      },
+    }),
+    [],
+  );
+  send({
+    ...spawn,
+    params: { ...spawn.params, update: { ...spawn.params.update, attempt_id: 'two' } },
+  });
+  assert.notEqual(events.at(-1).runId, first);
+  assert.deepEqual(
+    send(
+      vendor('grok-session', {
+        sessionUpdate: 'subagent_finished',
+        child_session_id: 'child',
+        attempt_id: 'one',
+        status: 'failed',
+      }),
+    ),
+    [],
+  );
+  assert.ok(events.every(isLodySubagentEvent));
+  for (const status of ['failed', 'cancelled', 'unrecognized']) {
+    send({
+      ...spawn,
+      params: { ...spawn.params, update: { ...spawn.params.update, attempt_id: status } },
+    });
+    send(vendor('grok-session', {
+      sessionUpdate: 'subagent_finished',
+      child_session_id: 'child',
+      attempt_id: status,
+      status,
+    }));
+    const snapshot = events.at(-1).snapshot;
+    assert.equal(snapshot.state, status === 'unrecognized' ? 'unknown' : status);
+    assert.equal(snapshot.outputIncomplete, status === 'unrecognized' ? true : undefined);
+    assert.ok(isLodySubagentEvent(events.at(-1)));
+  }
+});
 
 const promptUsage = {
   inputTokens: 1_000,
