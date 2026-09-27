@@ -9,6 +9,16 @@ configuration options.
 
 Supported configuration:
 
+Subagent history is opt-in through bilateral `_meta.lody.subagentEvents` v1.
+The adapter maps native spawn/progress/finish facts and child ACP output to
+`_lody/subagents/event`, including nested lineage and new execution IDs on reuse.
+Argument deltas accumulate as text, never as prematurely parsed JSON. Context
+tokens remain display progress, not billing. Consent stays on the root connection
+with run-scoped tool IDs; existing permission policy still applies. Run cancellation
+and output reads are not advertised. Legacy clients retain native notifications.
+The private event shape is source-verified in Grok 1.0.38/1.0.41; the pinned 1.0.40
+binary still needs live verification. Standalone releases need the new Core exports.
+
 - Initial permission mode from `_meta.lody.sessionConfig` maps to Grok's
   startup `_meta.yoloMode` before `session/new` or restore reaches the official
   runtime, with `_meta.autoMode=false`. Later changes map to

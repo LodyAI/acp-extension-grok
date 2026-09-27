@@ -70,6 +70,12 @@
   mode-switch decisions, unknown sessions, and requests without usable allow options interactive.
 - Never consume a pending client request when a reverse request uses the same id.
 
+## Subagent events
+
+- Negotiated subagent events admit children only through an owned native parent.
+  Preserve attempt identities and permission policy; child progress is not usage.
+  Native child replay must not create a fresh live execution.
+
 ## Session forks
 
 - Translate Core's standard `session/fork` and versioned `forkAtTurn` only in the

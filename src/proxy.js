@@ -1,4 +1,5 @@
 import { GrokSessionForkBridge } from './session-fork.js';
+import { GrokSubagentEvents } from './subagent-events.js';
 import { GrokPlanReviewBridge } from './plan-review.js';
 import runtimeManifest from '../runtime-manifest.json' with { type: 'json' };
 import {
@@ -6,6 +7,7 @@ import {
   LODY_PLAN_MODE_CONFIG_ID,
   createPlanModeConfigOption,
   SessionUsageAccumulator,
+  supportsLodySubagentEvents,
 } from 'acp-extension-core';
 
 const contract = runtimeManifest.privateWireContract;
@@ -35,6 +37,7 @@ const INTERNAL_REQUESTS = {
 const USD_TICKS_PER_USD = 10_000_000_000;
 const MAX_TRACKED_PROMPTS = 256;
 const GROK_LODY_CAPABILITIES = {
+  subagentEvents: { version: 1 },
   sessionTitle: { version: 1 },
   forkAtTurn: { version: 1 },
   usage: { version: 1 },
@@ -439,6 +442,7 @@ function translateInitialize(message) {
 
 export class GrokAcpCompatibilityProxy {
   constructor({ deferSessionResponseUntilModelSnapshot = false } = {}) {
+    this.subagents = new GrokSubagentEvents();
     this.sessions = new Map();
     this.planReviews = new GrokPlanReviewBridge();
     this.clientCapabilities = {};
@@ -1017,6 +1021,11 @@ export class GrokAcpCompatibilityProxy {
   handleRuntimeMethod(message) {
     message = this.forks.update(message);
     if (!message) return { toRuntime: [], toClient: [] };
+    if (supportsLodySubagentEvents(this.clientCapabilities)) {
+      const normalized = this.subagents.handle(message, this.sessions);
+      if (normalized?.length === 1 && normalized[0].method === 'session/request_permission') message = normalized[0];
+      else if (normalized !== null) return { toRuntime: [], toClient: normalized };
+    }
     const passthrough = { toRuntime: [], toClient: [message] };
     const logicalMethod = logicalExtensionMethod(message.method);
     if (logicalMethod === contract.planApprovalRequest) {
