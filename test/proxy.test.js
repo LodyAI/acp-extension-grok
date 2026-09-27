@@ -205,9 +205,12 @@ test('normalizes nested child streams, cumulative tool arguments, progress and f
       attempt_id: 'one',
       status: 'completed',
       output: 'Done',
+      tool_calls: 5,
+      turns: 3,
     }),
   );
   assert.equal(events.at(-1).snapshot.state, 'completed');
+  assert.deepEqual(events.at(-2).progress, { toolCallCount: 5, turnCount: 3 });
   assert.deepEqual(
     send({
       method: 'session/update',
@@ -235,6 +238,22 @@ test('normalizes nested child streams, cumulative tool arguments, progress and f
     [],
   );
   assert.ok(events.every(isLodySubagentEvent));
+  for (const status of ['failed', 'cancelled', 'unrecognized']) {
+    send({
+      ...spawn,
+      params: { ...spawn.params, update: { ...spawn.params.update, attempt_id: status } },
+    });
+    send(vendor('grok-session', {
+      sessionUpdate: 'subagent_finished',
+      child_session_id: 'child',
+      attempt_id: status,
+      status,
+    }));
+    const snapshot = events.at(-1).snapshot;
+    assert.equal(snapshot.state, status === 'unrecognized' ? 'unknown' : status);
+    assert.equal(snapshot.outputIncomplete, status === 'unrecognized' ? true : undefined);
+    assert.ok(isLodySubagentEvent(events.at(-1)));
+  }
 });
 
 const promptUsage = {

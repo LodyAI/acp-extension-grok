@@ -116,11 +116,12 @@ export class GrokSubagentEvents {
       emit(child, { type: 'progress', progress });
       if (update.sessionUpdate === 'subagent_finished') {
         child.live = false;
+        const state = ['completed', 'failed', 'cancelled'].includes(update.status)
+          ? update.status
+          : 'unknown';
         child.snapshot = {
           ...child.snapshot,
-          state: ['completed', 'failed', 'cancelled'].includes(update.status)
-            ? update.status
-            : 'unknown',
+          state,
           ...(typeof update.output === 'string' ? { summary: update.output } : {}),
           ...(typeof update.error === 'string'
             ? {
@@ -130,9 +131,7 @@ export class GrokSubagentEvents {
                 },
               }
             : {}),
-          ...(!['completed', 'failed', 'cancelled'].includes(update.status)
-            ? { outputIncomplete: true }
-            : {}),
+          ...(state === 'unknown' ? { outputIncomplete: true } : {}),
         };
         emit(child, { type: 'snapshot', snapshot: child.snapshot });
       }
