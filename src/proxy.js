@@ -4,6 +4,7 @@ import { GrokPlanReviewBridge } from './plan-review.js';
 import runtimeManifest from '../runtime-manifest.json' with { type: 'json' };
 import {
   LODY_EXTENSION_METHODS,
+  LODY_TOOL_NAMES,
   LODY_PLAN_MODE_CONFIG_ID,
   createPlanModeConfigOption,
   SessionUsageAccumulator,
@@ -37,6 +38,7 @@ const INTERNAL_REQUESTS = {
 const USD_TICKS_PER_USD = 10_000_000_000;
 const MAX_TRACKED_PROMPTS = 256;
 const GROK_LODY_CAPABILITIES = {
+  tasks: { version: 1, scheduled: true },
   subagentEvents: { version: 1 },
   sessionTitle: { version: 1 },
   forkAtTurn: { version: 1 },
@@ -49,6 +51,80 @@ export const GROK_MODEL_SNAPSHOT_SETTLE_TIMEOUT_MS = 2_000;
 
 function logicalExtensionMethod(method) {
   return typeof method === 'string' && method.startsWith('_') ? method.slice(1) : method;
+}
+
+const SCHEDULING_TOOLS = new Map([
+  ['scheduler_create', LODY_TOOL_NAMES.cronCreate],
+  ['scheduler_delete', LODY_TOOL_NAMES.cronDelete],
+  ['scheduler_list', LODY_TOOL_NAMES.cronList],
+]);
+
+/** Translate schedule ownership, not the execution/result of each fired subagent. */
+function scheduledTaskUpdate(message) {
+  const { update } = message.params;
+  const method = logicalExtensionMethod(message.method);
+  if (
+    message.method === 'session/update' &&
+    ['tool_call', 'tool_call_update'].includes(update?.sessionUpdate)
+  ) {
+    const native = update._meta?.['x.ai/tool'];
+    const toolName =
+      native?.version === 1 && native.namespace === 'grok_build'
+        ? SCHEDULING_TOOLS.get(native.name)
+        : undefined;
+    if (!toolName) return message;
+    return {
+      ...message,
+      params: {
+        ...message.params,
+        update: {
+          ...update,
+          _meta: { ...update._meta, lody: { ...update._meta?.lody, toolName } },
+        },
+      },
+    };
+  }
+  const event = update?.sessionUpdate;
+  if (
+    !['scheduled_task_created', 'scheduled_task_fired', 'scheduled_task_deleted'].includes(event) ||
+    ![`x.ai/${event}`, contract.sessionNotification].includes(method) ||
+    typeof update.task_id !== 'string' ||
+    !update.task_id.trim()
+  ) return message;
+  const deleted = event === 'scheduled_task_deleted';
+  if (!deleted && (typeof update.prompt !== 'string' || typeof update.human_schedule !== 'string'))
+    return message;
+  // Shutdown removes a UI chip, not the persisted schedule. Core has no suspended status.
+  if (deleted && update.reason === 'shutdown') return null;
+  const taskId = `grok-scheduled:${update.task_id}`;
+  const status = deleted
+    ? 'completed'
+    : event === 'scheduled_task_created' ? 'pending' : 'in_progress';
+  const task = {
+    version: 1,
+    taskId,
+    kind: 'scheduled',
+    status,
+    ...(!deleted ? { description: `${update.prompt} (${update.human_schedule})` } : {}),
+    ...(deleted
+      ? { summary: `Schedule removed (${typeof update.reason === 'string' ? update.reason : 'unknown'})` }
+      : {}),
+  };
+  return {
+    ...message,
+    method: 'session/update',
+    params: {
+      ...message.params,
+      update: {
+        sessionUpdate: 'tool_call_update',
+        toolCallId: taskId,
+        title: task.description ?? 'Scheduled task removed',
+        kind: 'other',
+        status,
+        _meta: { ...update._meta, lody: { ...update._meta?.lody, task } },
+      },
+    },
+  };
 }
 
 function wireExtensionMethod(method) {
@@ -1021,6 +1097,16 @@ export class GrokAcpCompatibilityProxy {
   handleRuntimeMethod(message) {
     message = this.forks.update(message);
     if (!message) return { toRuntime: [], toClient: [] };
+    const scheduleSessionId = message.params?.sessionId;
+    const ownsScheduleSession = this.sessions.has(scheduleSessionId) ||
+      (typeof scheduleSessionId === 'string' && [...this.pending.values()].some(
+        (pending) => pending.kind === 'session' && pending.sessionId === scheduleSessionId &&
+          ['session/load', 'session/resume'].includes(pending.method)
+      ));
+    if (ownsScheduleSession) {
+      message = scheduledTaskUpdate(message);
+      if (!message) return { toRuntime: [], toClient: [] };
+    }
     if (supportsLodySubagentEvents(this.clientCapabilities)) {
       const normalized = this.subagents.handle(message, this.sessions);
       if (normalized?.length === 1 && normalized[0].method === 'session/request_permission') message = normalized[0];
