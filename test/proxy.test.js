@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { isLodySubagentEvent } from 'acp-extension-core';
+import { isLodySubagentEvent, isLodySubagentOutput } from 'acp-extension-core';
 
 import runtimeManifest from '../runtime-manifest.json' with { type: 'json' };
 import {
@@ -106,6 +106,117 @@ function readyProxy(runtimeResponse = sessionResponse) {
   const startup = proxy.handleRuntime(runtimeResponse);
   return { proxy, startup, response: startup.toClient[0] };
 }
+
+test('scheduled task lifecycle preserves identity, replay metadata and recurring fires', () => {
+  const { proxy } = readyProxy();
+  const event = (kind, fields = {}, replay = false) => ({
+    jsonrpc: '2.0',
+    method: replay ? '_x.ai/session_notification' : `_x.ai/scheduled_task_${kind}`,
+    params: {
+      sessionId: 'grok-session',
+      _meta: { isReplay: replay, providerMarker: 'retained' },
+      update: {
+        sessionUpdate: `scheduled_task_${kind}`,
+        task_id: 'job-1',
+        ...(kind === 'deleted' ? {} : { prompt: 'Check CI', human_schedule: 'every 5 minutes', next_fire_at: null }),
+        ...fields,
+      },
+    },
+  });
+  const tasks = [];
+  for (const message of [
+    event('created', {}, true),
+    event('fired', { next_fire_at: '2026-09-29T10:05:00Z', subagent_id: 'child-1' }),
+    event('fired', { subagent_id: 'child-2' }),
+    event('created', { prompt: 'Check updated CI' }),
+    event('deleted', { reason: 'expired' }),
+  ]) {
+    const result = proxy.handleRuntime(message);
+    assert.deepEqual(result.toRuntime, []);
+    assert.equal(result.toClient.length, 1);
+    const normalized = result.toClient[0];
+    assert.equal(normalized.method, 'session/update');
+    assert.deepEqual(normalized.params._meta, message.params._meta);
+    assert.equal(normalized.params.sessionId, 'grok-session');
+    const update = normalized.params.update;
+    assert.equal(isLodySubagentOutput(update), true);
+    assert.equal(update.sessionUpdate, 'tool_call_update');
+    assert.equal(update.toolCallId, 'grok-scheduled:job-1');
+    assert.equal(update._meta.lody.task.kind, 'scheduled');
+    assert.equal(update._meta.lody.task.taskId, update.toolCallId);
+    tasks.push(update._meta.lody.task);
+  }
+  assert.deepEqual(tasks.map((task) => task.status), ['pending', 'in_progress', 'in_progress', 'pending', 'completed']);
+  assert.equal(tasks[3].description, 'Check updated CI (every 5 minutes)');
+  assert.equal(tasks[4].summary, 'Schedule removed (expired)');
+  assert.deepEqual(proxy.handleRuntime(event('deleted', { reason: 'shutdown' })).toClient, []);
+  for (const reason of ['completed', 'deleted', undefined]) {
+    const normalized = proxy.handleRuntime(event('deleted', { reason }, true)).toClient[0];
+    assert.equal(normalized.params.update._meta.lody.task.status, 'completed');
+  }
+  for (const invalid of [
+    { ...event('created'), params: { ...event('created').params, sessionId: 'foreign-session' } },
+    event('created', { task_id: '' }),
+    event('created', { task_id: 123 }),
+    event('created', { prompt: null }),
+    event('fired', { human_schedule: null }),
+    { ...event('created'), method: '_unrelated/notification' },
+    { ...event('created'), method: '_x.ai/scheduled_task_deleted' },
+  ]) {
+    assert.deepEqual(proxy.handleRuntime(invalid).toClient, [invalid]);
+  }
+});
+
+test('restoring schedule replay is translated before the session response, without admitting other sessions', () => {
+  for (const method of ['session/load', 'session/resume']) {
+    const proxy = new GrokAcpCompatibilityProxy();
+    proxy.handleClient({ id: 'restore', method, params: { sessionId: 'restoring', cwd: '/tmp/project', mcpServers: [] } });
+    const replay = {
+      method: '_x.ai/session_notification',
+      params: {
+        sessionId: 'restoring', _meta: { isReplay: true },
+        update: { sessionUpdate: 'scheduled_task_created', task_id: 'job', prompt: 'Check CI', human_schedule: 'every 5 minutes' },
+      },
+    };
+    const translated = proxy.handleRuntime(replay).toClient[0];
+    assert.equal(translated.params.update._meta.lody.task.status, 'pending');
+    assert.equal(translated.params._meta.isReplay, true);
+    const foreign = { ...replay, params: { ...replay.params, sessionId: 'foreign' } };
+    assert.deepEqual(proxy.handleRuntime(foreign).toClient, [foreign]);
+    proxy.handleRuntime({ id: 'restore', error: { code: -32603, message: 'Restore failed' } });
+    assert.deepEqual(proxy.handleRuntime(replay).toClient, [replay]);
+  }
+});
+
+test('maps only canonical Grok scheduler identities without rewriting interval inputs or failures', () => {
+  const { proxy } = readyProxy();
+  for (const [name, canonical] of [
+    ['scheduler_create', 'CronCreate'], ['scheduler_delete', 'CronDelete'], ['scheduler_list', 'CronList'],
+  ]) {
+    for (const sessionUpdate of ['tool_call', 'tool_call_update']) {
+      const message = {
+        jsonrpc: '2.0', method: 'session/update',
+        params: {
+          sessionId: 'grok-session',
+          update: {
+            sessionUpdate, toolCallId: 'tool-1', title: 'Display title', status: 'failed',
+            rawInput: { interval: '90m', prompt: 'Check CI' }, rawOutput: { error: 'Rejected' },
+            _meta: { 'x.ai/tool': { version: 1, namespace: 'grok_build', name }, lody: { turnId: 'turn-1' } },
+          },
+        },
+      };
+      const expected = structuredClone(message);
+      expected.params.update._meta.lody.toolName = canonical;
+      assert.deepEqual(proxy.handleRuntime(message).toClient, [expected]);
+      for (const native of [undefined, { version: 2, namespace: 'grok_build', name }, { version: 1, namespace: 'mcp', name }]) {
+        const unknown = structuredClone(message);
+        unknown.params.update._meta['x.ai/tool'] = native;
+        unknown.params.update.title = name;
+        assert.deepEqual(proxy.handleRuntime(unknown).toClient, [unknown]);
+      }
+    }
+  }
+});
 
 test('normalizes nested child streams, cumulative tool arguments, progress and fresh attempts only after negotiation', () => {
   const { proxy } = readyProxy();
@@ -2204,6 +2315,7 @@ test('fork capabilities preserve native capabilities and publish Core v1', () =>
     fork: {},
   });
   assert.deepEqual(result.agentCapabilities._meta.lody.forkAtTurn, { version: 1 });
+  assert.deepEqual(result.agentCapabilities._meta.lody.tasks, { version: 1, scheduled: true });
   assert.equal(result.agentCapabilities._meta.vendor, true);
 });
 

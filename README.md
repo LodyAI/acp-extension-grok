@@ -9,6 +9,26 @@ configuration options.
 
 Supported configuration:
 
+## Scheduled tasks
+
+The adapter advertises Core `tasks: { version: 1, scheduled: true }`.
+Native scheduled-task created/fired/deleted notifications become standard ACP
+tool updates carrying `_meta.lody.task` with `kind: "scheduled"` and a stable,
+namespaced task ID. Created means pending; fired means in progress, not finished;
+removal means completed schedule ownership, not successful subagent execution.
+Shutdown cleanup is ignored because the schedule can resume. Replay metadata is
+preserved, including replay arriving during session load/resume.
+
+Canonical Grok `x.ai/tool` identities for `scheduler_create`, `scheduler_delete`,
+and `scheduler_list` map to Core `CronCreate`, `CronDelete`, and `CronList`.
+Inputs, outputs, and errors retain their native meaning; interval is not converted
+to cron. This integrates the existing lifecycle schema, not the cron-based
+next-fire panel, schedule controls, or Lody's machine-owned schedules. No Core
+schema changes or new RPCs are introduced. Wire shapes are source-verified against
+grok-build `f0e3be1`; authenticated execution on pinned Grok 1.0.40 remains unverified.
+
+## Configuration and subagents
+
 Subagent history is opt-in through bilateral `_meta.lody.subagentEvents` v1.
 The adapter maps native spawn/progress/finish facts and child ACP output to
 `_lody/subagents/event`, including nested lineage and new execution IDs on reuse.

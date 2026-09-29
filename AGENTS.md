@@ -76,6 +76,15 @@
   Preserve attempt identities and permission policy; child progress is not usage.
   Native child replay must not create a fresh live execution.
 
+## Scheduled tasks
+
+- Translate only owned sessions (including pending load/resume replay). Keep
+  stable schedule IDs separate from subagent run IDs. A fire is not completion;
+  shutdown cleanup is not deletion. Preserve replay metadata.
+- Map scheduling tool identity from native `x.ai/tool`, never display titles or
+  MCP names. Keep interval input unchanged; Core's existing cron identity does
+  not authorize inventing cron timing or a next-fire timestamp.
+
 ## Session forks
 
 - Translate Core's standard `session/fork` and versioned `forkAtTurn` only in the
