@@ -30,6 +30,13 @@
 
 - Seed both `yoloMode` and `autoMode`, including explicit false, on new/load/resume/fork.
   Pre-session notifications cannot configure a session that does not exist yet.
+- Auto is available only after initialization reports at least the manifest's
+  `autoPermissionMinimumVersion`; reject unsupported Auto before creating/copying
+  a session. Keep client identifiers stable and reseed inherited selections on attach.
+- Permission options express the requested policy, not a native acknowledgement.
+  Grok's Auto gate can fall back to Ask. Do not infer effective state from version,
+  notification delivery, remote-only settings, or a successful config response.
+  Validate Auto against the official binary with the isolated native probe.
 - Live selections still use the client-scoped `x.ai/yolo_mode_changed` notification.
   Resolve new YOLO tool permissions in the adapter as described below; requests
   already forwarded to Lody remain owned by its durable permission flow.
@@ -61,8 +68,9 @@
 
 ## Permission fallback
 
-- Advertise only Ask and Always Approve. Retired startup Auto restores as Ask;
-  reject live Auto selections and explicitly disable native auto mode.
+- Advertise Ask, Auto (on compatible runtimes), and Always Approve. Auto delegates
+  classification entirely to Grok; never apply YOLO's approval fallback to Auto.
+  Switching to Ask or Always Approve explicitly disables native auto mode.
 - For a known session in Always Approve, answer native permission requests in
   the adapter, preferring `allow_once` then `allow_always`; match ACP option kinds,
   never substrings in labels or ids. Only select an option supplied by the request.

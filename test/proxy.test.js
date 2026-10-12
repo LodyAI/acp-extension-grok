@@ -91,8 +91,19 @@ const modelSnapshot = {
   },
 };
 
+function initializeProxy(proxy, version = '1.0.46') {
+  proxy.handleClient({
+    jsonrpc: '2.0',
+    id: 'init',
+    method: 'initialize',
+    params: { protocolVersion: 1 },
+  });
+  proxy.handleRuntime({ jsonrpc: '2.0', id: 'init', result: { _meta: { agentVersion: version } } });
+  return proxy;
+}
+
 function readyProxy(runtimeResponse = sessionResponse) {
-  const proxy = new GrokAcpCompatibilityProxy();
+  const proxy = initializeProxy(new GrokAcpCompatibilityProxy());
   proxy.handleClient({
     jsonrpc: '2.0',
     id: 1,
@@ -420,7 +431,7 @@ test('adapts the official runtime wire contract', () => {
     response.result.configOptions
       .find((option) => option.id === 'permission_mode')
       .options.map((option) => option.value),
-    ['ask', 'always-approve']
+    ['ask', 'auto', 'always-approve']
   );
   assert.deepEqual(
     response.result.configOptions.find((option) => option.id === 'plan_mode')?.type,
@@ -615,7 +626,12 @@ test('maps every permission mode to the official notification contract', () => {
     yolo_mode: false,
     auto_mode: false,
   });
-  assert.equal(permissionNotification(clientIdentifier, 'auto'), undefined);
+  assert.deepEqual(permissionNotification(clientIdentifier, 'auto').params, {
+    clientIdentifier,
+    permission_mode: 'auto',
+    yolo_mode: false,
+    auto_mode: true,
+  });
   assert.deepEqual(permissionNotification(clientIdentifier, 'always-approve').params, {
     clientIdentifier,
     permission_mode: 'always-approve',
@@ -687,38 +703,47 @@ test('applies initial always-approve to restored sessions', () => {
   }
 });
 
-test('restores retired Auto selections as Ask at the session boundary', () => {
-  for (const [permissionMode, expectedYoloMode, expectedRuntimeMessages] of [
-    ['ask', false, 1],
-    ['auto', false, 1],
-  ]) {
-    const proxy = new GrokAcpCompatibilityProxy();
-    const output = proxy.handleClient({
-      jsonrpc: '2.0',
-      id: 1,
-      method: 'session/new',
-      params: {
-        cwd: '/tmp/project',
-        mcpServers: [],
-        _meta: {
-          clientIdentifier,
-          lody: {
-            sessionConfig: {
-              version: 1,
-              configOptionValues: { permission_mode: permissionMode },
+test('seeds all permission flags on new/load/resume without pre-session notifications', () => {
+  for (const method of ['session/new', 'session/load', 'session/resume']) {
+    for (const mode of ['ask', 'auto', 'always-approve']) {
+      const proxy = initializeProxy(new GrokAcpCompatibilityProxy());
+      const output = proxy.handleClient({
+        jsonrpc: '2.0',
+        id: 1,
+        method,
+        params: {
+          sessionId: 'grok-session',
+          cwd: '/tmp/project',
+          mcpServers: [],
+          _meta: {
+            clientIdentifier,
+            yoloMode: true,
+            autoMode: true,
+            retained: 'native',
+            lody: {
+              other: 'kept',
+              sessionConfig: { version: 1, configOptionValues: { permission_mode: mode } },
             },
           },
         },
-      },
-    });
-    assert.equal(output.toRuntime.length, expectedRuntimeMessages);
-    assert.equal(output.toRuntime.at(-1).params._meta.yoloMode, expectedYoloMode);
-    assert.equal(output.toRuntime.at(-1).params._meta.autoMode, false);
-    const response = proxy.handleRuntime(sessionResponse).toClient[0];
-    assert.equal(
-      response.result.configOptions.find((option) => option.id === 'permission_mode').currentValue,
-      'ask'
-    );
+      });
+      assert.equal(output.toRuntime.length, 1);
+      const forwarded = output.toRuntime[0];
+      assert.equal(forwarded.method, method);
+      assert.equal(forwarded.params._meta.yoloMode, mode === 'always-approve');
+      assert.equal(forwarded.params._meta.autoMode, mode === 'auto');
+      assert.equal(forwarded.params._meta.retained, 'native');
+      assert.deepEqual(forwarded.params._meta.lody, { other: 'kept' });
+      const response = proxy.handleRuntime(sessionResponse).toClient[0];
+      assert.equal(
+        response.result.configOptions.find((o) => o.id === 'permission_mode').currentValue,
+        mode
+      );
+      const permission = permissionRequest();
+      const decision = proxy.handleRuntime(permission);
+      if (mode === 'always-approve') assertAutomatic(decision, 'single-use');
+      else assert.deepEqual(decision.toClient, [permission]);
+    }
   }
 });
 
@@ -744,10 +769,10 @@ test('optimistically syncs permission modes over the private extension notificat
   );
 });
 
-test('rejects live Auto selection without changing the active permission mode', () => {
+test('rejects unknown permission selections without changing the active permission mode', () => {
   const { proxy } = readyProxy();
   setPermission(proxy, 'always-approve');
-  const output = setPermission(proxy, 'auto');
+  const output = setPermission(proxy, 'unknown');
   assert.equal(output.toRuntime.length, 0);
   assert.ok(output.toClient[0].error);
   assert.equal(proxy.handleRuntime(permissionRequest()).toClient.length, 0);
@@ -761,6 +786,191 @@ function setPermission(proxy, value) {
     params: { sessionId: 'grok-session', configId: 'permission_mode', value },
   });
 }
+
+test('Auto is version-gated and never silently restored as another permission policy', () => {
+  for (const version of [undefined, '1.0.13', '1.0.40', '1.0.45', '1.0.46-beta', 'invalid']) {
+    const { proxy } = readyProxy();
+    initializeProxy(proxy, version === undefined ? null : version);
+    const option = proxy
+      .configOptions(proxy.sessions.get('grok-session'))
+      .find((o) => o.id === 'permission_mode');
+    assert.deepEqual(
+      option.options.map((o) => o.value),
+      ['ask', 'always-approve']
+    );
+    setPermission(proxy, 'always-approve');
+    const rejected = setPermission(proxy, 'auto');
+    assert.equal(rejected.toRuntime.length, 0);
+    assert.match(rejected.toClient[0].error.message, /1\.0\.46/);
+    assertAutomatic(proxy.handleRuntime(permissionRequest()), 'single-use');
+    for (const method of ['session/new', 'session/load', 'session/resume', 'session/fork']) {
+      const output = proxy.handleClient({
+        id: 3,
+        method,
+        params: {
+          sessionId: 'grok-session',
+          cwd: '/tmp/project',
+          mcpServers: [],
+          _meta: {
+            clientIdentifier,
+            lody: {
+              sessionConfig: { version: 1, configOptionValues: { permission_mode: 'auto' } },
+            },
+          },
+        },
+      });
+      assert.equal(output.toRuntime.length, 0, 'must reject before native creation or fork copy');
+      assert.match(output.toClient[0].error.message, /1\.0\.46/);
+    }
+  }
+  for (const version of ['1.0.46', '1.0.47', '1.1.0', '2.0.0']) {
+    const { proxy } = readyProxy();
+    initializeProxy(proxy, version);
+    assert.equal(setPermission(proxy, 'auto').toRuntime[0].params.auto_mode, true);
+  }
+});
+
+test('switching YOLO to Auto stops adapter approvals and preserves native decisions and client replies', () => {
+  const { proxy } = readyProxy();
+  setPermission(proxy, 'always-approve');
+  assertAutomatic(proxy.handleRuntime(permissionRequest()), 'single-use');
+  const selected = setPermission(proxy, 'auto');
+  assert.deepEqual(selected.toRuntime, [permissionNotification(clientIdentifier, 'auto')]);
+  const option = selected.toClient[0].result.configOptions.find((o) => o.id === 'permission_mode');
+  assert.equal(option.currentValue, 'auto');
+  assert.match(option.description, /not a runtime confirmation/);
+  // Every request remaining after Grok's classifier stays interactive, even
+  // if it offers allow_once/allow_always or collides with a pending client id.
+  proxy.handleClient({
+    id: 77,
+    method: 'session/prompt',
+    params: { sessionId: 'grok-session', prompt: [] },
+  });
+  for (const kind of ['edit', 'execute', 'switch_mode']) {
+    const permission = permissionRequest();
+    permission.params.toolCall.kind = kind;
+    assert.deepEqual(proxy.handleRuntime(permission), { toRuntime: [], toClient: [permission] });
+    assert.equal(proxy.pending.get(77).kind, 'prompt');
+  }
+  const reply = {
+    jsonrpc: '2.0',
+    id: 77,
+    result: { outcome: { outcome: 'selected', optionId: 'reject' } },
+  };
+  assert.deepEqual(proxy.handleClient(reply), { toRuntime: [reply], toClient: [] });
+  const denied = {
+    method: 'session/update',
+    params: {
+      sessionId: 'grok-session',
+      update: {
+        sessionUpdate: 'tool_call_update',
+        toolCallId: 'blocked',
+        status: 'failed',
+        rawOutput: 'Auto mode blocked this action',
+      },
+    },
+  };
+  assert.deepEqual(proxy.handleRuntime(denied).toClient, [denied]);
+  setPermission(proxy, 'ask');
+  assert.deepEqual(proxy.handleRuntime(permissionRequest()).toClient, [permissionRequest()]);
+  setPermission(proxy, 'always-approve');
+  assertAutomatic(proxy.handleRuntime(permissionRequest()), 'single-use');
+});
+
+test('Auto selections remain client-scoped and reseed replacement sessions including explicit false', () => {
+  const { proxy } = readyProxy();
+  setPermission(proxy, 'auto');
+  for (const [owner, expected] of [
+    [clientIdentifier, 'auto'],
+    ['lody:other', 'ask'],
+  ]) {
+    const output = proxy.handleClient({
+      id: 10,
+      method: 'session/new',
+      params: {
+        cwd: '/tmp/project',
+        mcpServers: [],
+        _meta: { clientIdentifier: owner, yoloMode: true, autoMode: true },
+      },
+    });
+    assert.equal(output.toRuntime[0].params._meta.yoloMode, false);
+    assert.equal(output.toRuntime[0].params._meta.autoMode, expected === 'auto');
+    const response = proxy.handleRuntime({
+      ...sessionResponse,
+      id: 10,
+      result: { ...sessionResponse.result, sessionId: owner },
+    });
+    assert.equal(
+      response.toClient[0].result.configOptions.find((o) => o.id === 'permission_mode')
+        .currentValue,
+      expected
+    );
+  }
+});
+
+test('Auto requires a client owner before creating or copying a session', () => {
+  const proxy = initializeProxy(new GrokAcpCompatibilityProxy());
+  for (const method of ['session/new', 'session/load', 'session/resume', 'session/fork']) {
+    const output = proxy.handleClient({
+      id: 1,
+      method,
+      params: {
+        sessionId: 'source',
+        cwd: '/tmp/project',
+        mcpServers: [],
+        _meta: {
+          lody: { sessionConfig: { version: 1, configOptionValues: { permission_mode: 'auto' } } },
+        },
+      },
+    });
+    assert.equal(output.toRuntime.length, 0);
+    assert.match(output.toClient[0].error.message, /clientIdentifier/);
+  }
+});
+
+test('Auto survives Plan and model changes while questions and plan approval remain explicit', () => {
+  const { proxy } = readyProxy();
+  setPermission(proxy, 'auto');
+  for (const [configId, value] of [
+    ['plan_mode', true],
+    ['model', 'grok-build'],
+  ]) {
+    const request = proxy.handleClient({
+      id: 20,
+      method: 'session/set_config_option',
+      params: {
+        sessionId: 'grok-session',
+        configId,
+        value,
+      },
+    });
+    const response = proxy.handleRuntime({ id: request.toRuntime[0].id, result: {} });
+    assert.equal(
+      response.toClient[0].result.configOptions.find((o) => o.id === 'permission_mode')
+        .currentValue,
+      'auto'
+    );
+  }
+  const question = {
+    id: 20,
+    method: 'elicitation/create',
+    params: { sessionId: 'grok-session', message: 'Synthetic question' },
+  };
+  assert.deepEqual(proxy.handleRuntime(question).toClient, [question]);
+  const review = proxy.handleRuntime({
+    jsonrpc: '2.0',
+    id: 21,
+    method: '_x.ai/exit_plan_mode',
+    params: {
+      sessionId: 'grok-session',
+      toolCallId: 'plan-auto',
+      planContent: 'Synthetic plan',
+    },
+  });
+  assert.equal(review.toRuntime.length, 0);
+  assert.equal(review.toClient.at(-1).method, 'session/request_permission');
+  assert.equal(review.toClient.at(-1).params.toolCall.kind, 'switch_mode');
+});
 
 function permissionRequest(
   options = [

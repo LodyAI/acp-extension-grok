@@ -1,7 +1,7 @@
 {
   "officialRuntime": {
     "package": "@xai-official/grok",
-    "version": "1.0.40",
+    "version": "1.0.46",
     "minimumSupportedVersion": "1.0.34"
   },
   "privateWireContract": {
@@ -17,7 +17,8 @@
     "billingRequest": "x.ai/billing",
     "weeklyUsagePeriodType": "USAGE_PERIOD_TYPE_WEEKLY",
     "reasoningEffortMeta": "reasoningEffort",
-    "autoPermissionMode": false,
+    "autoPermissionMode": true,
+    "autoPermissionMinimumVersion": "1.0.46",
     "planApprovalRequest": "x.ai/exit_plan_mode"
   }
 }

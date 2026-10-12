@@ -15,6 +15,7 @@ const contract = runtimeManifest.privateWireContract;
 
 const PERMISSION_MODES = {
   ask: { permission_mode: 'ask', yolo_mode: false, auto_mode: false },
+  auto: { permission_mode: 'auto', yolo_mode: false, auto_mode: true },
   'always-approve': {
     permission_mode: 'always-approve',
     yolo_mode: true,
@@ -473,11 +474,12 @@ function readLodySessionConfigOption(meta, configId) {
   return typeof value === 'string' || typeof value === 'boolean' ? value : undefined;
 }
 
-function translateSessionStart(message) {
+function translateSessionStart(message, previousMode) {
   const params = message.params ?? {};
   const requestedMode = readLodySessionConfigOption(params._meta, 'permission_mode');
-  // Retired Auto selections restore conservatively; never upgrade them to YOLO.
-  const permissionMode = requestedMode === 'auto' ? 'ask' : requestedMode;
+  // Seed every attach, including explicit false. A client notification cannot
+  // initialize a future session, and omitting the seeds inherits native defaults.
+  const permissionMode = requestedMode ?? previousMode ?? 'ask';
   const mapped = typeof permissionMode === 'string' ? PERMISSION_MODES[permissionMode] : undefined;
   if (!mapped) return { message, permissionMode: undefined };
 
@@ -488,7 +490,7 @@ function translateSessionStart(message) {
       _meta: {
         ...stripLodySessionConfig(params._meta),
         yoloMode: mapped.yolo_mode,
-        autoMode: false,
+        autoMode: mapped.auto_mode,
       },
     },
   };
@@ -531,10 +533,23 @@ export class GrokAcpCompatibilityProxy {
     // Grok scopes permission mode to the Lody clientIdentifier, not to a session,
     // so the selection outlives any single session and is stored by client.
     this.permissionModes = new Map();
+    this.runtimeVersion = undefined;
     this.nextInternalRequestId = Number.MAX_SAFE_INTEGER;
     this.forks = new GrokSessionForkBridge((kind, operation, method, params) =>
       this.runtimeRequest({ kind, operation }, method, params)
     );
+  }
+
+  supportsAutoPermission() {
+    if (!contract.autoPermissionMode) return false;
+    const version = /^(\d+)\.(\d+)\.(\d+)$/.exec(this.runtimeVersion ?? '');
+    if (!version) return false;
+    const minimum = contract.autoPermissionMinimumVersion.split('.').map(Number);
+    for (let i = 0; i < 3; i += 1) {
+      const difference = Number(version[i + 1]) - minimum[i];
+      if (difference !== 0) return difference > 0;
+    }
+    return true;
   }
 
   applyCurrentModel(state, currentModelId, reportedReasoningEffort) {
@@ -791,6 +806,42 @@ export class GrokAcpCompatibilityProxy {
         toClient: [],
       };
     }
+    if (
+      ['session/new', 'session/load', 'session/resume', 'session/fork'].includes(message.method)
+    ) {
+      const mode = readLodySessionConfigOption(params._meta, 'permission_mode');
+      if (mode !== undefined && !Object.hasOwn(PERMISSION_MODES, mode)) {
+        return {
+          toRuntime: [],
+          toClient: [errorResponse(message.id, 'Unsupported Grok permission mode')],
+        };
+      }
+      if (mode === 'auto' && !this.supportsAutoPermission()) {
+        return {
+          toRuntime: [],
+          toClient: [
+            errorResponse(
+              message.id,
+              `Auto requires a Grok runtime reporting version ${contract.autoPermissionMinimumVersion} or newer`
+            ),
+          ],
+        };
+      }
+      if (
+        mode === 'auto' &&
+        (typeof params._meta?.clientIdentifier !== 'string' || !params._meta.clientIdentifier)
+      ) {
+        return {
+          toRuntime: [],
+          toClient: [
+            errorResponse(
+              message.id,
+              'Grok Auto permission mode requires the current Lody clientIdentifier'
+            ),
+          ],
+        };
+      }
+    }
     if (message.method === 'session/fork') return this.forks.start(message);
     if (
       message.method === 'session/new' ||
@@ -799,7 +850,7 @@ export class GrokAcpCompatibilityProxy {
     ) {
       this.forks.turnBySession.delete(params.sessionId);
       const clientIdentifier = params._meta?.clientIdentifier;
-      const translated = translateSessionStart(message);
+      const translated = translateSessionStart(message, this.permissionModes.get(clientIdentifier));
       if (translated.permissionMode && typeof clientIdentifier === 'string') {
         this.permissionModes.set(clientIdentifier, translated.permissionMode);
       }
@@ -845,6 +896,17 @@ export class GrokAcpCompatibilityProxy {
     if (configId === 'permission_mode') {
       if (!Object.hasOwn(PERMISSION_MODES, value)) {
         return unsupportedConfigOption(message.id, configId);
+      }
+      if (value === 'auto' && !this.supportsAutoPermission()) {
+        return {
+          toRuntime: [],
+          toClient: [
+            errorResponse(
+              message.id,
+              `Auto requires a Grok runtime reporting version ${contract.autoPermissionMinimumVersion} or newer`
+            ),
+          ],
+        };
       }
       const notification = permissionNotification(state.clientIdentifier, value);
       if (!notification || !state.clientIdentifier) {
@@ -987,6 +1049,7 @@ export class GrokAcpCompatibilityProxy {
     if (pending.kind === 'initialize') {
       if (message.error) return { toRuntime: [], toClient: [message] };
       const result = message.result ?? {};
+      this.runtimeVersion = result._meta?.agentVersion ?? result.agentInfo?.version;
       const agentCapabilities = result.agentCapabilities ?? {};
       return {
         toRuntime: [],
@@ -1362,12 +1425,21 @@ export class GrokAcpCompatibilityProxy {
         description: 'Approve protected actions automatically',
       },
     ];
+    if (this.supportsAutoPermission()) {
+      permissions.splice(1, 0, {
+        value: 'auto',
+        name: 'Auto',
+        description: 'Ask Grok to assess actions automatically; native policy can still require approval',
+      });
+    }
     const options = [
       createPlanModeConfigOption(state.interactionMode === 'plan'),
       selectOption(
         'permission_mode',
         'Permission Mode',
-        'Controls protected tool approvals',
+        this.permissionModes.get(state.clientIdentifier) === 'auto'
+          ? 'Auto requested. Grok may fall back to Ask if Auto is disabled; this selection is not a runtime confirmation.'
+          : 'Requested policy for protected tool approvals',
         this.permissionModes.get(state.clientIdentifier) ?? 'ask',
         permissions,
         '_permission'

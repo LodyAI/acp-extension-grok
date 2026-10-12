@@ -25,7 +25,7 @@ Inputs, outputs, and errors retain their native meaning; interval is not convert
 to cron. This integrates the existing lifecycle schema, not the cron-based
 next-fire panel, schedule controls, or Lody's machine-owned schedules. No Core
 schema changes or new RPCs are introduced. Wire shapes are source-verified against
-grok-build `f0e3be1`; authenticated execution on pinned Grok 1.0.40 remains unverified.
+grok-build `f0e3be1`; authenticated scheduling on pinned Grok 1.0.46 remains unverified.
 
 ## Configuration and subagents
 
@@ -36,12 +36,13 @@ Argument deltas accumulate as text, never as prematurely parsed JSON. Context
 tokens remain display progress, not billing. Consent stays on the root connection
 with run-scoped tool IDs; existing permission policy still applies. Run cancellation
 and output reads are not advertised. Legacy clients retain native notifications.
-The private event shape is source-verified in Grok 1.0.38/1.0.41; the pinned 1.0.40
-binary still needs live verification. Core 0.1.9 supplies the event contract.
+The private event shape is source-verified in Grok 1.0.38/1.0.41; subagent execution
+on pinned 1.0.46 still needs live verification. Core 0.1.9 supplies the event contract.
 
 - Initial permission mode from `_meta.lody.sessionConfig` maps to Grok's
-  startup `_meta.yoloMode` before `session/new` or restore reaches the official
-  runtime, with `_meta.autoMode=false`. Later changes map to
+  startup `_meta.yoloMode` and `_meta.autoMode` before new/load/resume/fork reaches
+  the official runtime. Both flags are explicit, including false. Omitted selections
+  inherit the wrapper's client-scoped policy, otherwise Ask. Later changes map to
   `x.ai/yolo_mode_changed` with the current Lody `clientIdentifier`, which is
   registered during ACP initialization. In Always Approve (YOLO), the adapter
   answers native `session/request_permission` requests directly: prefer
@@ -84,12 +85,52 @@ binary still needs live verification. Core 0.1.9 supplies the event contract.
   but omits the percentage, the adapter mirrors the official `/usage` UI's weekly `0%`.
   Billing failures never fail a session.
 
-Only Ask and Always Approve are advertised. Retired Auto selections in startup
-metadata restore as Ask; live attempts to select Auto are rejected. Permission
-changes still use an unacknowledged native notification, so the returned config
-snapshot represents the adapter's accepted policy, not a runtime acknowledgement.
-The fallback applies to incoming requests; requests already forwarded to a client
-remain owned by that client. Standard elicitation requests pass through unchanged.
+Ask, Auto, and Always Approve are advertised when initialization reports Grok
+1.0.46 or newer. Older/unknown runtimes retain Ask and Always Approve; requesting
+Auto then fails before session creation or native fork copying. A startup Auto
+selection also requires the current client identifier. The baseline compatibility
+floor remains 1.0.34; Auto has its own verified version floor.
+
+Auto requests `yoloMode=false, autoMode=true` and delegates the decisions to Grok's
+native classifier. Any permission requests it emits stay interactive, including
+classifier failures, questions, and Plan approval. The adapter never automatically
+answers them. Switching out of Auto explicitly disables it; switching from YOLO
+to Auto immediately stops the adapter's YOLO approval fallback.
+
+Permission changes use an unacknowledged native notification. The returned config
+snapshot is the **requested policy**, not proof of the effective runtime state;
+Auto's option description makes this limitation explicit. Grok can disable Auto
+through its own environment/config/managed/remote gate and execute with Ask instead.
+The adapter does not override that gate, parse debug logs, inject hooks, or treat a
+remote-only settings flag as the effective policy. The official runtime currently
+offers no effective-permission query. Requests already forwarded to a client remain
+owned by that client. Standard elicitation requests pass through unchanged.
+
+The protocol setter applies immediately when called. A host's input-box draft does
+not call that setter by itself: Lody must submit the config or send
+`session/set_config_option` for the active session. This adapter does not change
+that host interaction. Host static catalogs and managed-runtime artifacts must be
+updated when integrating this version.
+
+## Native Auto verification
+
+```sh
+GROK_PATH=/path/to/official/grok node scripts/probe-auto-permissions.mjs
+```
+
+This opt-in probe runs the production adapter with the official binary, isolated
+config/history, and a loopback model fixture. It uses synthetic credentials only.
+Native hook observations verify the effective mode; local classifier requests and
+file markers verify actual permission decisions and execution. Hooks are test
+instruments, not part of the adapter's production permission handling.
+
+Verified on macOS arm64 Grok 1.0.46: startup, warm/cold load and resume, fork,
+source preservation, Ask/Auto/YOLO transitions, classifier allow/block/unavailable,
+and disabled Auto at startup and during live selection. These checks exercise the
+official runtime but do not measure a hosted model's classification quality or
+validate another platform. The [permission spec](specs/auto-permissions.md) and
+[decision record](.agents/notes/implemented/feature/2026-10-07-native-auto-permissions.md)
+describe the confirmation boundary and supersede the earlier Auto retirement.
 
 Run with:
 
@@ -164,6 +205,6 @@ cwd values, and unchanged source files:
 GROK_PATH=/path/to/official/grok node scripts/probe-session-fork.mjs
 ```
 
-The probe passes on 1.0.34 and 1.0.40. Authenticated child continuation, concurrent
+The probe passes on 1.0.34, 1.0.40, and 1.0.46. Authenticated child continuation, concurrent
 live persistence, and cross-compaction targeted forks need further end-to-end
 validation.
