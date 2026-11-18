@@ -2,6 +2,8 @@
 
 Lody's ACP compatibility adapter for the official Grok runtime.
 
+The current runtime pin is 1.0.88. Observations below retain the versions they were verified against.
+
 The adapter does not contain, build, patch, or publish Grok. It launches the
 official runtime supplied through `GROK_PATH` and translates the small private
 wire contract pinned in `runtime-manifest.json` into standard ACP session
@@ -25,7 +27,7 @@ Inputs, outputs, and errors retain their native meaning; interval is not convert
 to cron. This integrates the existing lifecycle schema, not the cron-based
 next-fire panel, schedule controls, or Lody's machine-owned schedules. No Core
 schema changes or new RPCs are introduced. Wire shapes are source-verified against
-grok-build `f0e3be1`; authenticated scheduling on pinned Grok 1.0.46 remains unverified.
+grok-build `f0e3be1`; authenticated scheduling on Grok 1.0.46 remains unverified.
 
 ## Configuration and subagents
 
@@ -37,7 +39,7 @@ tokens remain display progress, not billing. Consent stays on the root connectio
 with run-scoped tool IDs; existing permission policy still applies. Run cancellation
 and output reads are not advertised. Legacy clients retain native notifications.
 The private event shape is source-verified in Grok 1.0.38/1.0.41; subagent execution
-on pinned 1.0.46 still needs live verification. Core 0.1.9 supplies the event contract.
+on 1.0.46 still needs live verification. Core 0.1.9 supplies the event contract.
 
 - Initial permission mode from `_meta.lody.sessionConfig` maps to Grok's
   startup `_meta.yoloMode` and `_meta.autoMode` before new/load/resume/fork reaches

@@ -1,7 +1,7 @@
 {
   "officialRuntime": {
     "package": "@xai-official/grok",
-    "version": "1.0.46",
+    "version": "1.0.88",
     "minimumSupportedVersion": "1.0.34"
   },
   "privateWireContract": {
