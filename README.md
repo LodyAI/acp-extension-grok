@@ -39,7 +39,7 @@ tokens remain display progress, not billing. Consent stays on the root connectio
 with run-scoped tool IDs; existing permission policy still applies. Run cancellation
 and output reads are not advertised. Legacy clients retain native notifications.
 The private event shape is source-verified in Grok 1.0.38/1.0.41; subagent execution
-on 1.0.46 still needs live verification. Core 0.1.9 supplies the event contract.
+on 1.0.46 still needs live verification. Core 0.4.0 supplies the event contract.
 
 - Initial permission mode from `_meta.lody.sessionConfig` maps to Grok's
   startup `_meta.yoloMode` and `_meta.autoMode` before new/load/resume/fork reaches
